@@ -65,7 +65,25 @@ jobs:
           git add prices.db
           if git diff --cached --quiet; then
             echo "No DB changes"
-          else
-            git commit -m "chore: price history update [skip ci]"
-            git push
+            exit 0
           fi
+          git commit -m "chore: price history update [skip ci]"
+          # Remote мог уйти вперёд (правки через веб-интерфейс, соседний
+          # прогон) — подтягиваем чужие коммиты и ставим наш поверх;
+          # при конфликте бинарной prices.db побеждает свежая версия
+          # с раннера.
+          for i in 1 2 3; do
+            if git push; then
+              echo "prices.db отправлен (попытка $i)"
+              exit 0
+            fi
+            echo "push отклонён — подтягиваю remote (попытка $i/3)"
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git checkout --theirs prices.db 2>/dev/null || true
+              GIT_EDITOR=true git rebase --continue 2>/dev/null || true
+            fi
+            sleep 5
+          done
+          echo "::error::prices.db не отправлен: remote продолжает уходить вперёд"
+          exit 1
