@@ -33,6 +33,7 @@ log = logging.getLogger("monitor")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(os.path.dirname(HERE), "prices.db")
 STOP_KEY = "stopped"
+DBKEY_FLAG = "dbkey_broken"  # meta-флаг «DB_KEY задан, но битый»
 
 
 def _mark_commit():
@@ -78,8 +79,38 @@ def _crypto(cfg):
         log.warning("DB_KEY не задан — мультипользовательский режим "
                     "выключен (личный мониторинг работает)")
         return None
-    from .crypto import Crypto
-    return Crypto(key)
+    try:
+        from .crypto import Crypto
+        return Crypto(key)
+    except ValueError:
+        log.error(
+            "DB_KEY задан, но это не корректный Fernet-ключ (нужно 44 "
+            "символа url-safe base64, заканчиваются на '='). Ключ нельзя "
+            "придумать самому — сгенерируйте командой:\n"
+            "  python -c \"import base64, os; "
+            "print(base64.urlsafe_b64encode(os.urandom(32)).decode())\"\n"
+            "и обновите секрет DB_KEY. Мультипользовательский режим "
+            "выключен, личный мониторинг владельца продолжит работу.")
+        return None
+
+
+def _dbkey_alert(db: DB, crypto, admin_chat: str):
+    """Разовое TG-оповещение админу о битом DB_KEY; сброс флага при починке."""
+    if not admin_chat:
+        return
+    broken = bool(os.environ.get("DB_KEY")) and crypto is None
+    if broken and db.get_meta(DBKEY_FLAG) != "1":
+        token = os.environ.get("TG_TOKEN")
+        if token:
+            send_text(token, admin_chat,
+                      "⚠️ <b>Секрет DB_KEY задан неверно</b> — бот не принимает "
+                      "команды пользователей, личный мониторинг работает.\n\n"
+                      "Сгенерируйте ключ:\n<code>python -c \"import base64, os; "
+                      "print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+                      "\"</code>\nи обновите секрет DB_KEY в настройках репо.")
+        db.set_meta(DBKEY_FLAG, "1")
+    elif not broken and db.get_meta(DBKEY_FLAG) == "1":
+        db.set_meta(DBKEY_FLAG, "0")  # ключ починили — разрешаем будущие алерты
 
 
 def run_monitor(cfg: dict) -> int:
@@ -95,6 +126,7 @@ def run_monitor(cfg: dict) -> int:
         crypto = _crypto(cfg)
         admin_chat = (os.environ.get("ADMIN_CHAT_ID")
                       or os.environ.get("TG_CHAT_ID") or "")
+        _dbkey_alert(db, crypto, admin_chat)
         if crypto and os.environ.get("TG_TOKEN") and admin_chat:
             from . import bot
             try:
