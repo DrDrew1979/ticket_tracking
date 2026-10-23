@@ -53,7 +53,7 @@ def build_text(t: dict, bests: list[dict], series_fn) -> str:
         lines.append(trend_verdict(series_fn(best["depart_date"],
                                              best["return_date"])))
 
-    # отсечка: личная дата + эвристический совет
+    # отсечка: личная дата + эвристический совет + совет по накопленным данным
     lines.append("")
     cutoff = t.get("cutoff")
     if cutoff:
@@ -74,6 +74,9 @@ def build_text(t: dict, bests: list[dict], series_fn) -> str:
                              f"риск остаться без билетов выше.")
         except (KeyError, ValueError):
             pass
+        hint = _cutoff_hint(t, bests, series_fn)
+        if hint:
+            lines.append(hint)
 
     c = t.get("calib")
     if c:
@@ -116,6 +119,66 @@ def run_user_digests(cfg, db, crypto) -> int:
                            last_digest=now_msk.date().isoformat())
     log.info("Дайджестов отправлено: %d", sent)
     return sent
+
+
+def _rising_pct(series: list) -> float | None:
+    """Рост цен: сравнение средних за первую и вторую половины ряда.
+
+    series: [(YYYY-MM-DD, минимум)]. None — наблюдений меньше 10.
+    """
+    if not series or len(series) < 10:
+        return None
+    ys = [p for _, p in sorted(series)]
+    h = len(ys) // 2
+    first = sum(ys[:h]) / h
+    second = sum(ys[h:]) / (len(ys) - h)
+    if first <= 0:
+        return None
+    return (second / first - 1) * 100.0
+
+
+def _cutoff_hint(t: dict, bests: list[dict], series_fn) -> str | None:
+    """Предложение перенести дату отсечки по накопленным данным.
+
+    Срабатывает, пока до отсечки больше 3 дней. Приоритет:
+    1) калибровка есть и лучшая цена уже у минимума маршрута —
+       ждать отсечки незачем;
+    2) свой ряд наблюдений (≥ 10 дн.) показывает рост минимумов —
+       предлагаем конкретную более раннюю дату.
+    Максимум один совет за дайджест.
+    """
+    cutoff = t.get("cutoff")
+    if not cutoff or not bests:
+        return None
+    try:
+        cut = date.fromisoformat(cutoff)
+        if (cut - date.today()).days <= 3:
+            return None  # менять что-то поздно — отсечка вот-вот
+        best = min(bests, key=lambda x: x["price"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    # 1) цена уже на уровне минимума маршрута (по калибровке)
+    cmin = (t.get("calib") or {}).get("min")
+    if cmin and best.get("price") and best["price"] <= cmin * 1.05:
+        p = f"{best['price']:,}".replace(",", " ")
+        m = f"{cmin:,}".replace(",", " ")
+        return (f"💡 Совет по данным: лучшая цена сейчас {p} ₽ — "
+                f"на уровне минимума маршрута ({m} ₽). Можно покупать, "
+                f"не дожидаясь отсечки, или перенести её ближе: /watch")
+    # 2) накопленный ряд наблюдений: минимумы растут
+    try:
+        series = series_fn(best["depart_date"], best.get("return_date"))
+    except Exception:
+        series = []
+    pct = _rising_pct(series)
+    if pct is not None and pct >= 10.0:
+        prop = min(date.today() + timedelta(days=3),
+                   cut - timedelta(days=1))
+        return (f"💡 Совет по данным: за {len(series)} дн. наблюдений "
+                f"минимальные цены на ваш маршрут выросли примерно на "
+                f"{pct:.0f}%. Рекомендую перенести дату отсечки ближе — "
+                f"например на {_d(prop.isoformat())}: /watch")
+    return None
 
 
 def _d(iso):
