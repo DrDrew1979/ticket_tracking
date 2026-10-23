@@ -86,7 +86,7 @@
    |---|---|
    | `TP_TOKEN` | токен Travelpayouts |
    | `TG_TOKEN` | токен бота |
-   | `TG_CHAT_ID` | ваш chat_id (владелец) |
+   | `TG_CHAT_ID` | ваш chat_id (получатель ежедневного дайджеста; можно опустить — тогда дайджест уйдёт на `ADMIN_CHAT_ID`) |
    | `DB_KEY` | ключ шифрования: `python -c "from src.crypto import gen_key; print(gen_key())"` |
    | `ADMIN_CHAT_ID` | ваш chat_id (админ; = TG_CHAT_ID) |
    | `HC_URL` | (опционально) ping-URL healthchecks.io |
