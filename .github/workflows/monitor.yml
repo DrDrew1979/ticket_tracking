@@ -2,12 +2,13 @@ name: flight-monitor
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # мониторинг каждые 30 минут
-    - cron: "0 6 * * *"      # ежедневный дайджест: 06:00 UTC = 09:00 МСК
+    - cron: "*/30 * * * *"   # мониторинг + приём команд бота (каждые 30 мин)
+    - cron: "0 6 * * *"      # дайджест владельца: 06:00 UTC = 09:00 МСК
+    - cron: "0 * * * *"      # персональные дайджесты пользователей (ежечасно)
   workflow_dispatch:
     inputs:
       mode:
-        description: "monitor | digest"
+        description: "monitor | digest | udigest"
         default: "monitor"
         type: string
 
@@ -22,13 +23,14 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install deps
         run: pip install -r requirements.txt
@@ -39,6 +41,8 @@ jobs:
             echo "MODE=${{ inputs.mode }}" >> "$GITHUB_ENV"
           elif [[ "${{ github.event.schedule }}" == "0 6 * * *" ]]; then
             echo "MODE=digest" >> "$GITHUB_ENV"
+          elif [[ "${{ github.event.schedule }}" == "0 * * * *" ]]; then
+            echo "MODE=udigest" >> "$GITHUB_ENV"
           else
             echo "MODE=monitor" >> "$GITHUB_ENV"
           fi
@@ -48,6 +52,9 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          HC_URL: ${{ secrets.HC_URL }}
+          DB_KEY: ${{ secrets.DB_KEY }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
         run: python -m src.main --mode "$MODE"
 
       - name: Commit price history
