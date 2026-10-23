@@ -82,6 +82,11 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DB_KEY: ${{ secrets.DB_KEY }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          # Токен Travelpayouts: подсказка целевой цены на шаге 6 визарда
+          # (один запрос к кэшу Aviasales). Без него бот отвечает
+          # «Не смог получить текущие цены». Сбор статистики в БД идёт
+          # в monitor.yml — там TP_TOKEN уже был.
+          TP_TOKEN: ${{ secrets.TP_TOKEN }}
           # Опционально: LLM-шутка к подтверждению (Z.ai GLM, бесплатная
           # Flash-модель). Секрета нет — подтверждение уходит без шутки.
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
