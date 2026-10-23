@@ -10,8 +10,9 @@
   --mode udigest : ежечасно — персональные дайджесты пользователей,
                    подошедшие по их личному расписанию.
 
-Секреты: TP_TOKEN, TG_TOKEN, TG_CHAT_ID (владелец),
-DB_KEY (Fernet-ключ шифрования персональных данных),
+Секреты: TP_TOKEN, TG_TOKEN, TG_CHAT_ID (адресат личного дайджеста
+владельца; можно опустить — тогда дайджест и финал уйдут на
+ADMIN_CHAT_ID), DB_KEY (Fernet-ключ шифрования персональных данных),
 ADMIN_CHAT_ID (админ; по умолчанию = TG_CHAT_ID),
 опционально HC_URL (маячок healthchecks.io).
 
@@ -50,6 +51,17 @@ def _hc_url(cfg) -> str:
     return os.environ.get("HC_URL") or hc.get("url") or ""
 
 
+def _owner_chat() -> str:
+    """Адресат ЛИЧНЫХ сообщений владельца (дайджест, финал мониторинга).
+
+    TG_CHAT_ID, а если он не задан — ADMIN_CHAT_ID (роли владельца и
+    администратора обычно у одного человека, поэтому дублировать chat_id
+    в двух секретах не обязательно).
+    """
+    return (os.environ.get("TG_CHAT_ID")
+            or os.environ.get("ADMIN_CHAT_ID") or "")
+
+
 def _final_text(cfg) -> str:
     last = max(date.fromisoformat(cfg["return_window"]["date_from"]),
                date.fromisoformat(cfg["return_window"]["date_to"]))
@@ -65,7 +77,7 @@ def _check_stop(cfg: dict, db: DB) -> bool:
             log.info("Даты сдвинуты (остановка теперь %s) — возобновляем", sd)
         return False
     if db.get_meta(STOP_KEY) != "1":
-        token, chat = os.environ.get("TG_TOKEN"), os.environ.get("TG_CHAT_ID")
+        token, chat = os.environ.get("TG_TOKEN"), _owner_chat()
         if token and chat:
             send_text(token, chat, _final_text(cfg))
         db.set_meta(STOP_KEY, "1")
@@ -170,9 +182,10 @@ def run_digest(cfg: dict) -> int:
     """Ежедневный дайджест владельца (свежие данные + тренд + отсечка)."""
     token = os.environ.get("TP_TOKEN")
     tg_token = os.environ.get("TG_TOKEN")
-    tg_chat = os.environ.get("TG_CHAT_ID")
+    tg_chat = _owner_chat()
     if not (token and tg_token and tg_chat):
-        log.error("Нужны TP_TOKEN, TG_TOKEN и TG_CHAT_ID в Secrets")
+        log.error("Нужны TP_TOKEN и TG_TOKEN в Secrets, а также "
+                  "TG_CHAT_ID или ADMIN_CHAT_ID (адресат дайджеста)")
         return 2
     client = TPClient(token, marker=cfg.get("marker") or None)
     db = DB(DB_PATH)
