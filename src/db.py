@@ -78,18 +78,28 @@ class DB:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
+        # ВАЖНО: миграция ДО схемы. В старой базе (до мультиюзера) нет
+        # колонки uid; если сначала выполнить executescript(SCHEMA), то
+        # CREATE INDEX ... ON observations(uid, ...) упадёт с ошибкой
+        # «no such column: uid», т.к. CREATE TABLE IF NOT EXISTS не
+        # изменяет уже существующую таблицу.
         self._migrate()
+        self.conn.executescript(SCHEMA)
         self.conn.commit()
 
     def _migrate(self):
-        """Добавление uid в старые таблицы (идемпотентно)."""
+        """Добавление uid в старые таблицы (идемпотентно).
+
+        На свежей базе таблиц ещё нет (PRAGMA вернёт пустой список) —
+        тогда шаг пропускается: SCHEMA создаст их сразу с uid.
+        """
         for table in ("observations", "alerts"):
             cols = [r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")]
-            if "uid" not in cols:
+            if cols and "uid" not in cols:
                 self.conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN uid TEXT NOT NULL "
                     f"DEFAULT '{OWNER}'")
+                self.conn.commit()
                 log.info("Миграция: %s.uid добавлен", table)
 
     def close(self):
