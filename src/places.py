@@ -4,10 +4,20 @@
 https://autocomplete.travelpayouts.com/places2?term=...&locale=ru
 Ответ: [{code, name, type: city|airport, country_name, weight, ...}]
 
-Правила по ТЗ: 1–5 совпадений -> нумерованный список; больше 5 ->
-просьба уточнить ввод. Если сеть недоступна или автокомплит не нашёл
-ничего — офлайн-фолбэк с нечётким поиском (difflib) по стартовому
-списку популярных пунктов (учитывает опечатки).
+Правила (после Задачи 13): ВСЕГДА показываем до 5 лучших совпадений,
+тупика «слишком много совпадений» больше нет. Ранжирование: точное
+совпадение названия — первым (город важнее аэропорта, дальше по
+популярности weight). Так «Москва» возвращает «Москва — все аэропорты
+[MOW]» первой строкой, а не отказ: одноимённых городов с аэропортами
+в мире нет, «лишние» совпадения — это аэропорты самой Москвы и шум
+нечёткого поиска (например «Мисава», Япония, weight=2).
+
+Формат запроса «город, страна» — для настоящих однофамильцев
+(«Мельбурн, Австралия»): указанная страна получает приоритет в ранге.
+
+Если сеть недоступна или автокомплит не нашёл ничего — офлайн-фолбэк
+с нечётким поиском (difflib) по стартовому списку популярных пунктов
+(учитывает опечатки).
 """
 import difflib
 import logging
@@ -96,15 +106,19 @@ def _label(item: dict) -> str:
 
 
 def _norm(s: str) -> str:
-    return " ".join((s or "").lower().split())[:64]
+    return " ".join((s or "").lower().replace("ё", "е").split())[:64]
 
 
 def _offline(term: str, limit: int):
-    """difflib-поиск по стартовому списку (терпит опечатки)."""
+    """difflib-поиск по стартовому списку (терпит опечатки).
+
+    Возвращает (top-limit лучших, truncated) — как онлайн-ветку.
+    """
+    main = term.partition(",")[0].strip()
     names = list(STARTER.keys())
-    close = difflib.get_close_matches(term, names, n=limit * 2, cutoff=0.62)
-    exact = [n for n in names if n == term]
-    pref = [n for n in names if n.startswith(term) and n != term]
+    close = difflib.get_close_matches(main, names, n=limit * 2, cutoff=0.62)
+    exact = [n for n in names if n == main]
+    pref = [n for n in names if n.startswith(main) and n != main]
     ordered = exact + pref + [c for c in close if c not in exact + pref]
     out = []
     for n in ordered[:limit]:
@@ -116,24 +130,32 @@ def _offline(term: str, limit: int):
 
 
 def search(term: str, limit: int = 5, timeout: int = 10):
-    """Возвращает (candidates, too_many, error).
+    """Возвращает (candidates, truncated, error).
 
-    candidates: [{"code": "MOW", "label": "Москва — все аэропорты…"}]
-    too_many: True -> просим уточнить ввод; error: True -> сервис недоступен.
+    candidates: до limit лучших совпадений, точное название города —
+    первым: [{"code": "MOW", "label": "Москва — все аэропорты…"}]
+    truncated: True — совпадений больше limit, показаны лучшие
+    (клиент показывает мягкое примечание, а не отказ);
+    error: True — сервис недоступен и офлайн-фолбэк тоже не помог.
     """
     term = _norm(term)
     if len(term) < 2:
         return [], False, False
+    # «город, страна» — уточнение для однофамильцев
+    main, _, hint = term.partition(",")
+    main, hint = main.strip(), hint.strip()
+    if len(main) < 2:
+        return [], False, False
     try:
         r = requests.get(
-            URL, params={"term": term, "locale": "ru",
+            URL, params={"term": main, "locale": "ru",
                          "types[]": ["city", "airport"]},
             timeout=timeout)
         r.raise_for_status()
         items = r.json() or []
     except Exception as e:  # сеть/JSON — тихий офлайн-фолбэк
         log.warning("autocomplete недоступен: %s", e)
-        cands, too = _offline(term, limit)
+        cands, too = _offline(main, limit)
         if cands:
             return cands, too, False
         return [], False, True  # не нашли и сеть лежит
@@ -149,21 +171,30 @@ def search(term: str, limit: int = 5, timeout: int = 10):
         except (TypeError, ValueError):
             weight = 0
         res.append({"item": it, "label": _label(it), "code": code,
-                    "name": (it.get("name") or "").lower(),
+                    "name": _norm(it.get("name") or ""),
                     "weight": weight})
 
     if not res:
-        cands, too = _offline(term, limit)
+        cands, too = _offline(main, limit)
         return cands, too, False
 
     def rank(x):
         nm = x["name"]
-        return (0 if nm == term else 1 if nm.startswith(term)
-                else 2 if term in nm else 3,
+        m = (0 if nm == main else 1 if nm.startswith(main)
+             else 2 if main in nm else 3)
+        if m == 3:  # в названии запроса нет — но это аэропорт ИСКОМОГО города?
+            assoc = _norm(x["item"].get("city_name")
+                          or x["item"].get("main_airport_name") or "")
+            if assoc and (assoc == main or main in assoc or assoc in main):
+                m = 2  # аэропорты города — выше постороннего шума (Мисава)
+        if hint:  # страна из запроса «город, страна» — сильнее всего остального
+            cn = _norm(x["item"].get("country_name") or "")
+            if hint not in cn:
+                m += 10
+        return (m,
                 0 if x["item"].get("type") == "city" else 1,
                 -x["weight"])
 
     res.sort(key=rank)
-    if len(res) > limit:
-        return [], True, False
-    return [{"code": x["code"], "label": x["label"]} for x in res], False, False
+    return ([{"code": x["code"], "label": x["label"]} for x in res[:limit]],
+            len(res) > limit, False)

@@ -1,11 +1,16 @@
 """Точка входа. Режимы:
 
   --mode monitor : каждые 30 мин по cron:
-                   1) приём команд Telegram (getUpdates, без сервера);
+                   1) фолбэк-приём команд Telegram (getUpdates), если
+                      отключён отдельный поллер (SKIP_TG_POLL=1 — приём
+                      команд пропускается, обычно он и не нужен);
                    2) личный мониторинг владельца (config.yaml);
                    3) мониторинг трекингов пользователей бота
                       (частота: владелец — каждый прогон, остальные —
                       не чаще раза в час; глобальный бюджет пар).
+  --mode bot     : НЕПРЕРЫВНЫЙ long polling Telegram внутри прогона
+                   (workflow tg-live-poll, cron */5) — ответы за 1–3 с,
+                   запросов к API цен нет.
   --mode digest  : ежедневный дайджест владельца (06:00 UTC = 09:00 МСК).
   --mode udigest : ежечасно — персональные дайджесты пользователей,
                    подошедшие по их личному расписанию.
@@ -22,6 +27,7 @@ ADMIN_CHAT_ID (админ; по умолчанию = TG_CHAT_ID),
 import argparse
 import logging
 import os
+import time
 from datetime import date
 
 from .config import date_pairs, load_config, stop_date
@@ -42,6 +48,48 @@ def _mark_commit():
     if env_file:
         with open(env_file, "a", encoding="utf-8") as f:
             f.write("NEED_COMMIT=1\n")
+
+
+def _commit_db() -> bool:
+    """Коммит prices.db (состояние диалогов + tg_offset) в репозиторий.
+
+    Вызывается live-поллером после каждой обработанной пачки апдейтов,
+    чтобы состояние пережило рестарт раннера. Логика повторяет шаг
+    Commit в workflow: до 3 попыток push, между ними rebase, при
+    конфликте бинарной prices.db побеждает версия с раннера.
+    Вне git-репозитория (локальный запуск, тесты) — тихий no-op.
+    """
+    import subprocess
+    repo = os.path.dirname(DB_PATH)
+
+    def git(*args, env=None):
+        return subprocess.run(["git", *args], cwd=repo,
+                              capture_output=True, text=True, env=env)
+
+    try:
+        if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+            return True  # не репозиторий — пропускаем
+    except OSError:
+        return True
+    git("config", "user.name", "flight-monitor-bot")
+    git("config", "user.email", "actions@users.noreply.github.com")
+    git("add", "prices.db")
+    if git("diff", "--cached", "--quiet").returncode == 0:
+        return True
+    git("commit", "-m", "chore: dialog state & tg offset [skip ci]")
+    for attempt in (1, 2, 3):
+        if git("push").returncode == 0:
+            return True
+        log.warning("push отклонён (%d/3) — подтягиваю remote", attempt)
+        git("fetch", "origin", "main")
+        if git("rebase", "origin/main").returncode != 0:
+            git("checkout", "--theirs", "prices.db")
+            git("rebase", "--continue",
+                env=dict(os.environ, GIT_EDITOR="true"))
+        time.sleep(5)
+    log.error("prices.db не отправлен — если прогон завершится без "
+              "успешного push, Telegram вернёт эти апдейты заново")
+    return False
 
 
 def _hc_url(cfg) -> str:
@@ -134,12 +182,17 @@ def run_monitor(cfg: dict) -> int:
     db = DB(DB_PATH)
     hc = _hc_url(cfg)
     try:
-        # 1. команды Telegram -> база (шифрование обязательно)
+        # 1. команды Telegram -> база (шифрование обязательно).
+        # Обычный путь — непрерывный поллер tg-live-poll (poll.yml, cron */5);
+        # два одновременных getUpdates-клиента Telegram запрещает (409),
+        # поэтому здесь поллируем ТОЛЬКО если отдельный поллер отключили
+        # (тогда удалите SKIP_TG_POLL из monitor.yml).
         crypto = _crypto(cfg)
         admin_chat = (os.environ.get("ADMIN_CHAT_ID")
                       or os.environ.get("TG_CHAT_ID") or "")
         _dbkey_alert(db, crypto, admin_chat)
-        if crypto and os.environ.get("TG_TOKEN") and admin_chat:
+        if (crypto and os.environ.get("TG_TOKEN") and admin_chat
+                and os.environ.get("SKIP_TG_POLL") != "1"):
             from . import bot
             try:
                 n = bot.poll_and_process(os.environ["TG_TOKEN"], db, crypto,
@@ -246,16 +299,58 @@ def run_udigest(cfg: dict) -> int:
         db.close()
 
 
+def run_bot(cfg: dict) -> int:
+    """Живой режим: НЕПРЕРЫВНЫЙ long polling Telegram внутри прогона.
+
+    Workflow tg-live-poll запускает его по cron каждые 5 минут; процесс
+    живёт BOT_LIVE_SECONDS (по умолчанию 240 с) и отвечает на сообщения
+    за 1–3 секунды. После каждой пачки апдейтов цены.db коммитится в
+    репозиторий (_commit_db), следующий cron-запуск подхватывает очередь;
+    соседний инстанс гасится concurrency cancel-in-progress в poll.yml.
+    Цены НЕ запрашивает — тяжёлый опрос остаётся на monitor-расписании.
+    Healthcheck не пингует (маячок следит за 30-минутным monitor-ритмом).
+    NEED_COMMIT (фолбэк-коммит на уровне workflow) — только если были
+    апдейты.
+    """
+    crypto = _crypto(cfg)
+    tg_token = os.environ.get("TG_TOKEN")
+    admin_chat = (os.environ.get("ADMIN_CHAT_ID")
+                  or os.environ.get("TG_CHAT_ID") or "")
+    if not (crypto and tg_token and admin_chat):
+        return 0
+    db = DB(DB_PATH)
+    try:
+        from . import bot
+        try:
+            live_s = int(os.environ.get("BOT_LIVE_SECONDS", "240") or 240)
+        except ValueError:
+            live_s = 240
+        n = bot.live_loop(tg_token, db, crypto, cfg, admin_chat,
+                          deadline=time.monotonic() + max(0, live_s),
+                          on_batch=_commit_db)
+        if n:
+            log.info("Обработано команд/сообщений: %d", n)
+            _mark_commit()  # фолбэк-коммит на уровне workflow (обычно уже не нужен)
+        return 0
+    except Exception:
+        # Telegram не должен ронять workflow (следующий запуск через ≤5 мин)
+        log.exception("Опрос Telegram упал (не критично)")
+        return 0
+    finally:
+        db.close()
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["monitor", "digest", "udigest"],
+    ap.add_argument("--mode",
+                    choices=["monitor", "bot", "digest", "udigest"],
                     default="monitor")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
     cfg = load_config(args.config)
-    rc = {"monitor": run_monitor, "digest": run_digest,
+    rc = {"monitor": run_monitor, "bot": run_bot, "digest": run_digest,
           "udigest": run_udigest}[args.mode](cfg)
     raise SystemExit(rc)
 

@@ -1,15 +1,26 @@
 """Telegram-бот: приём команд через getUpdates (без сервера 24/7).
 
-Workflow каждые 30 минут в начале прогона забирает неразобранные апдейты
-(Telegram хранит их 24 ч), обрабатывает и фиксирует offset в prices.db.
-Задержка реакции на команду — до 30 минут, для задачи мониторинга это
-нормально; отдельный сервер не нужен.
+Два режима опроса:
+
+1. live_loop — непрерывный long polling внутри одного прогона Actions
+   (workflow tg-live-poll, cron */5): ответ на сообщение за 1–3 секунды.
+   Telegram сам держит соединение и присылает апдейты сразу. Инстанс живёт
+   ~4 минуты (BOT_LIVE_SECONDS), новый cron-запуск подхватывает очередь;
+   соседний инстанс на время старта гасится concurrency cancel-in-progress.
+2. poll_and_process — разовый короткий опрос в начале monitor-прогона
+   (фолбэк на случай, если tg-live-poll отключён; по умолчанию в monitor
+   отключён через SKIP_TG_POLL, чтобы не конфликтовать 409 с live-поллером).
+
+Offset обрабатанных апдейтов хранится в prices.db (meta tg_offset) и
+коммитится в репозиторий после каждой обработанной пачки — состояние
+диалога переживает рестарты раннеров.
 
 Тихий режим бана: сообщения забаненного пользователя игнорируются без
 ответа и без изменения состояния.
 """
 import json
 import logging
+import time
 
 import requests
 
@@ -18,9 +29,9 @@ from . import dialog, places, users as U
 log = logging.getLogger(__name__)
 
 
-def _tg(token: str, method: str, **params) -> dict:
+def _tg(token: str, method: str, http_timeout: int = 20, **params) -> dict:
     r = requests.post(f"https://api.telegram.org/bot{token}/{method}",
-                      json=params, timeout=20)
+                      json=params, timeout=http_timeout)
     data = r.json() if r.headers.get("content-type", "").startswith(
         "application/json") else {}
     if not data.get("ok"):
@@ -65,7 +76,7 @@ ADMIN_HELP = (
 
 
 def poll_and_process(token: str, db, crypto, cfg, admin_chat) -> int:
-    """Забирает и обрабатывает апдейты. Возвращает число обработанных."""
+    """Разовый короткий опрос (фолбэк monitor-прогона). Возвращает число обработанных."""
     offset = int(db.get_meta("tg_offset", "0") or 0)
     try:
         data = _tg(token, "getUpdates", offset=offset, timeout=0,
@@ -82,6 +93,60 @@ def poll_and_process(token: str, db, crypto, cfg, admin_chat) -> int:
     if updates:
         db.set_meta("tg_offset", max(u["update_id"] for u in updates) + 1)
     return len(updates)
+
+
+def live_loop(token: str, db, crypto, cfg, admin_chat, deadline: float,
+              on_batch=None) -> int:
+    """Непрерывный long polling до дедлайна (точка time.monotonic()).
+
+    Отвечает за 1–3 секунды: getUpdates(timeout=25) держит соединение,
+    Telegram присылает апдейты немедленно. После каждой обработанной
+    пачки вызывается on_batch() (коммит prices.db), чтобы offset и
+    состояние диалога пережили рестарт раннера.
+
+    Конфликт 409 (другой getUpdates-клиент: monitor-прогон с фолбэком
+    или соседний инстанс в момент перезапуска) и 429 (flood) — пауза
+    и повтор. Возвращает число обработанных апдейтов.
+    """
+    offset = int(db.get_meta("tg_offset", "0") or 0)
+    processed = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 3:
+            break
+        lp = 25 if remaining >= 35 else max(1, int(remaining) - 5)
+        try:
+            data = _tg(token, "getUpdates", offset=offset, timeout=lp,
+                       http_timeout=lp + 15, allowed_updates=["message"])
+        except requests.RequestException as e:
+            log.warning("getUpdates недоступен: %s", e)
+            time.sleep(5)
+            continue
+        if not data.get("ok"):
+            try:
+                ra = int((data.get("parameters") or {}).get("retry_after") or 0)
+            except (TypeError, ValueError):
+                ra = 0
+            time.sleep(min(max(ra, 3), 30))  # 409/429: сосед забирает апдейты
+            continue
+        updates = (data.get("result") or [])[:30]
+        for upd in updates:
+            try:
+                _process_update(token, db, crypto, cfg, admin_chat, upd)
+            except Exception:
+                log.exception("Ошибка обработки апдейта %s",
+                              upd.get("update_id"))
+        if updates:
+            offset = max(u["update_id"] for u in updates) + 1
+            db.set_meta("tg_offset", offset)
+            processed += len(updates)
+            if on_batch:
+                try:
+                    on_batch()
+                except Exception:
+                    log.exception("on_batch (коммит БД) не удался — продолжаем; "
+                                  "непушенные апдейты Telegram вернёт снова")
+    return processed
 
 
 def _process_update(token, db, crypto, cfg, admin_chat, upd):
