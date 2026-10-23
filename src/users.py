@@ -171,10 +171,10 @@ def tracking_multiline(t: dict) -> str:
         f"Маршрут: {t.get('origin_name')} → {t.get('dest_name')}"
         f"{' → ' + t.get('origin_name') if not t.get('oneway') else ''}",
         f"Тип: {'только туда' if t.get('oneway') else 'туда и обратно'}",
-        f"Окно вылета: {_win(t['out'])}",
+        f"Полёт «туда»: {_win(t['out'])}",
     ]
     if not t.get("oneway") and t.get("ret"):
-        lines.append(f"Окно возврата: {_win(t['ret'])}")
+        lines.append(f"Полёт «обратно»: {_win(t['ret'])}")
     lines.append(f"Дата отсечки: {_fmt(t.get('cutoff'))}")
     lines.append(f"Целевая цена: {t.get('target'):,} ₽".replace(",", " "))
     lines.append(f"Дайджест: каждые {t.get('digest_every')} дн. в "
@@ -208,9 +208,18 @@ def _win(w: dict) -> str:
     d0 = date.fromisoformat(w["from"])
     d1 = d0 + timedelta(days=int(w["days"]) - 1)
     if w["days"] == 1:
-        return (f"{d0:%d.%m.%Y} {w['t1']}–{w['t2']}")
-    return (f"{d0:%d.%m.%Y} ({w['t1']}) – {d1:%d.%m.%Y} ({w['t2']})")
+        return (f"{d0:%d.%m.%Y} {_DOW[d0.weekday()]} "
+                f"{w['t1']}–{w['t2']}")
+    return (f"{d0:%d.%m.%Y} {_DOW[d0.weekday()]} ({w['t1']}) – "
+            f"{d1:%d.%m.%Y} {_DOW[d1.weekday()]} ({w['t2']})")
+
+
+_DOW = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
 def _fmt(iso: str | None) -> str:
-    return f"{date.fromisoformat(iso):%d.%m.%Y}" if iso else "—"
+    """«16.07.2027 Пт» — дата + день недели (или «—»)."""
+    if not iso:
+        return "—"
+    d = date.fromisoformat(iso)
+    return f"{d:%d.%m.%Y} {_DOW[d.weekday()]}"

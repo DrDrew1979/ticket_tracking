@@ -7,24 +7,39 @@
 Модель: бесплатная Flash-модель Z.ai (OpenAI-совместимый API,
 endpoint https://api.z.ai/api/paas/v4/chat/completions).
 
+ВАЖНО (причина «шутка не появляется» в версии с таймаутом 5 с):
+у GLM-4.5 (включая Flash) режим размышлений (thinking) включён ПО
+УМОЛЧАНИЮ — модель тратила весь бюджет max_tokens на рассуждения
+(reasoning_content), поле content приходило пустым, плюс режим
+размышлений замедлял ответ и приводил к таймауту. Поэтому запрос ЯВНО
+шлёт "thinking": {"type": "disabled"} (нестандартный параметр Z.ai,
+OpenAI-клиенты его просто игнорируют).
+
 Принципы надежности (фича декоративная и НЕ должна ломать бот):
 - ZAI_API_KEY не задан -> шутки нет, подтверждение обычное (CI/офлайн);
-- таймаут 5 с или любая ошибка сети/API -> шутки нет;
+- таймаут или любая ошибка сети/API -> шутки нет;
 - НИКАКИХ сообщений об ошибке пользователь не видит: подтверждение
   выглядит так, будто шутки и не планировалось;
+- причина отказа ВСЕГДА пишется в лог (log.warning) — в GitHub Actions
+  её видно в логах прогона tg-live-poll (поиск по «LLM»);
 - длина жёстко ограничена 250 знаками с пробелами: промпт требует
   короткий ответ, а _trim() страхует, даже если модель нарушит лимит
   (обрезка по границе предложения, иначе — по границе слова).
 
-Переопределение без правки кода (env): ZAI_BASE_URL, ZAI_MODEL.
+Переопределение без правки кода (env): ZAI_BASE_URL, ZAI_MODEL,
+ZAI_TIMEOUT (секунды, по умолчанию 8).
 """
 import json
+import logging
 import os
 import re
+import urllib.error
 import urllib.request
 
+log = logging.getLogger(__name__)
+
 MAX_LEN = 250
-DEFAULT_TIMEOUT = 5.0
+DEFAULT_TIMEOUT = 8.0
 
 _SYS = ("Ты — автор коротких остроумных шуток для Telegram-бота "
         "авиабилетов. Отвечай ТОЛЬКО текстом шутки на русском языке: "
@@ -97,14 +112,17 @@ def _trim(text: str, n: int = MAX_LEN) -> str:
 
 
 def make(origin_name: str | None, dest_name: str | None, month: int,
-         timeout: float = DEFAULT_TIMEOUT) -> str:
+         timeout: float | None = None) -> str:
     """Шутка ≤ 250 знаков про маршрут и сезон. Пусто — если не вышло.
 
-    Никогда не бросает исключений и не печатает ошибок: при любой
-    проблеме возвращается "", и подтверждение отправляется без шутки.
+    Никогда не бросает исключений и не роняет бот: при любой проблеме
+    возвращается "", а причина пишется в лог (видно в Actions).
     """
     if not (os.environ.get("ZAI_API_KEY") or "").strip():
-        return ""                      # ключа нет — фича отключена
+        log.info("LLM: ZAI_API_KEY не задан — шутка пропущена")
+        return ""
+    timeout = timeout if timeout is not None else \
+        float(os.environ.get("ZAI_TIMEOUT") or DEFAULT_TIMEOUT)
     try:
         o = short_place(origin_name)
         d = short_place(dest_name)
@@ -114,10 +132,24 @@ def make(origin_name: str | None, dest_name: str | None, month: int,
                     {"role": "user",
                      "content": _TPL.format(n=MAX_LEN, o=o, d=d,
                                             s=_season(month))}],
+                "thinking": {"type": "disabled"},
                 "temperature": 1.0,
-                "max_tokens": 200}
+                "max_tokens": 300}
         data = _post(body, timeout)
-        text = _clean(data["choices"][0]["message"]["content"] or "")
-    except Exception:
-        return ""                      # тишина: таймаут/сеть/API
+        msg = (data.get("choices") or [{}])[0].get("message") or {}
+        text = _clean(msg.get("content") or "")
+        if not text:
+            reason = ("есть reasoning_content, пустой content (thinking "
+                      "не отключился?)" if msg.get("reasoning_content")
+                      else f"пустой ответ: {str(data)[:200]}")
+            log.warning("LLM: модель вернула пустой content — %s", reason)
+            return ""
+    except urllib.error.HTTPError as e:
+        log.warning("LLM: HTTP %s — %s", e.code, (e.read()[:150] or b""))
+        return ""
+    except Exception as e:  # тишина для пользователя, диагноз — в лог
+        log.warning("LLM: запрос не удался (%s: %s)",
+                    type(e).__name__, str(e)[:150])
+        return ""
+    log.info("LLM: шутка получена (%d знаков)", len(text))
     return _trim(text) if text else ""

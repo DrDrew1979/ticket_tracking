@@ -4,14 +4,15 @@
   1. Город/аэропорт вылета (ввод названия -> выбор из кнопок)
   2. Город/аэропорт прилёта
   3. Тип поездки (кнопки «только туда» / «туда и обратно»)
-  4. Окно вылета: дата (календарь) + дни (кнопки) + время (по умолчанию
+  4. Полёт «туда»: дата (календарь, даты за 400 дней помечены ✖) +
+     гибкая настройка периода (кнопки-диапазоны) + время (по умолчанию
      весь день 00:00–23:59, опционально «Настроить время суток»)
-  5. Окно возврата (только для «туда и обратно», аналогично шагу 4)
-  6. Дата отсечки (по умолчанию: за 14 дней до начала окна вылета, но
+  5. Полёт «обратно» (только для «туда и обратно», аналогично шагу 4)
+  6. Дата отсечки (по умолчанию: за 14 дней до даты вылета, но
      не раньше сегодняшнего дня; календарь) + целевая цена (один поиск
      в кэше Aviasales, кнопка с ценой −15%, свой ввод или «без цели»)
-  7. Дайджест: частота (кнопки, по умолчанию 1 день) и время (часы,
-     по умолчанию 09:00 МСК), кнопка «Подтвердить»
+  7. Дайджест: частота (кнопки, по умолчанию 1 день) и время (часы
+     [ЧЧ]:[ММ], по умолчанию 09:00 МСК), кнопка «Подтвердить»
 
 Финальное меню — сводка с кнопками «Подтвердить» и «Изменить» («Изменить»
 открывает меню блоков, правка любого блока с возвратом к проверке).
@@ -20,8 +21,10 @@
 на месте). Текстовый ввод остался там, где без него нельзя: названия
 городов, своя цена, время «1057»/«10:57» как дублирующий способ.
 
-Режим изменения: /edit (или /stop → /watch) подставляет прежние значения;
-у каждого блока есть кнопка «⏭ Оставить …». Состояние шифруется
+Режим изменения: /edit открывает СВОДКУ текущих параметров («Изменить»
+-> меню блоков -> правка -> возврат к сводке) — весь визард заново не
+проходится. /watch после /stop подставляет прежние значения в каждый
+шаг; у каждого блока есть кнопка «⏭ Оставить …». Состояние шифруется
 (dialog_enc в prices.db) — переживает рестарты раннеров.
 """
 import logging
@@ -65,6 +68,18 @@ def _d(iso) -> str:
     return f"{date.fromisoformat(iso):%d.%m.%Y}"
 
 
+def _dw(d) -> str:
+    """Двухбуквенный день недели: Пн/Вт/Ср/Чт/Пт/Сб/Вс."""
+    return ui.DOW[d.weekday()]
+
+
+def _ddw(d) -> str:
+    """«16.07.2027 Пт» — дата + двухбуквенный день недели."""
+    if not isinstance(d, date):
+        d = date.fromisoformat(d)
+    return f"{d:%d.%m.%Y} {_dw(d)}"
+
+
 def _rub(n) -> str:
     return f"{n:,} ₽".replace(",", " ")
 
@@ -94,6 +109,12 @@ def _win_dates(w) -> tuple:
     return d0, d0 + timedelta(days=int(w["days"]) - 1)
 
 
+def _win_range(w) -> str:
+    """«16.07.2027 Пт – 18.07.2027 Вс» или одна дата с днём недели."""
+    d0, d1 = _win_dates(w)
+    return _ddw(d0) if d0 == d1 else f"{_ddw(d0)} – {_ddw(d1)}"
+
+
 def _ok(what: str, kept: bool = False) -> str:
     return f"✅ Принято: {what}" + (" (оставлено прежнее)" if kept else "")
 
@@ -105,7 +126,8 @@ _BLK_N = {"city_from": 1, "city_pick": 1, "city_to": 2, "trip": 3,
           "out_clk1": 4, "out_clk2": 4,
           "ret_date": 5, "ret_days": 5, "ret_time_ask": 5,
           "ret_clk1": 5, "ret_clk2": 5,
-          "cutoff": 6, "target": 6, "target_manual": 6, "digest": 7}
+          "cutoff": 6, "target": 6, "target_manual": 6, "digest": 7,
+          "dig_clk": 7}
 
 
 def _head(st, title: str) -> str:
@@ -269,10 +291,23 @@ def begin(db, crypto, uid: str) -> dict:
 
 
 def begin_edit(db, crypto, uid: str, tracking: dict) -> dict:
-    """/edit при активном трекинге: правка с подстановкой прежних значений."""
-    st = _new_state(True, tracking)
+    """/edit при активном трекинге: сразу сводка -> выбор блока -> правка.
+
+    Весь визард заново НЕ запускается (раньше это выглядело как рестарт
+    настройки с экрана 1). Пользователь видит текущие параметры, кнопкой
+    «✏️ Изменить» открывает меню блоков, правит нужный и возвращается
+    к сводке. Сохранение — «✅ Подтвердить».
+    """
+    st = {"st": "summary", "draft": _draft_from_prev(tracking),
+          "ui": {}, "edit": True, "last": tracking, "editmenu": 0}
     _save(db, crypto, uid, st)
-    return _greeting(st)
+    m = summary_msg(st)
+    m["text"] = ("✏️ <b>Изменение отслеживания</b> — текущие параметры:\n\n"
+                 + m["text"]
+                 + "\n\nНажмите «✏️ Изменить», выберите блок и внесите "
+                   "правки — после правки вернётесь к этой сводке. "
+                   "Если менять ничего не нужно — «🚪 Выйти».")
+    return m
 
 
 # ---------------------------------------------------------------- города
@@ -334,6 +369,9 @@ def _city_picked(db, crypto, uid, st, idx: int):
     st["cand"] = None
     st["pick_for"] = None
     echo = _ok(f"{what} — {c['label']}")
+    if st.get("editmenu"):    # правка из меню блоков: назад к сводке
+        _save(db, crypto, uid, st)
+        return _to_summary(db, crypto, uid, st, echo)
     if field == "origin":
         st["st"] = "city_to"
         _save(db, crypto, uid, st)
@@ -378,53 +416,72 @@ def _to_summary(db, crypto, uid, st, echo: str) -> dict:
     return {"msgs": [m], "edit": True}
 
 
+def _horizon_note(hi) -> str:
+    """Пояснение про лимит продажи 400 дней (✖ в календаре)."""
+    return (f"\n✖ — билеты ещё не продаются: выбор доступен максимум на "
+            f"{_MAX_HORIZON_DAYS} дней вперёд, до <b>{_ddw(hi)}</b> "
+            "включительно.")
+
+
 def _q_out_date(st) -> dict:
     lo, hi = _cal_bounds("out", st)
     if "y" not in (st.get("ui") or {}):
         y, m = _cal_default_month(st, "out")
         st.setdefault("ui", {})["y"], st["ui"]["m"] = y, m
     kb = _cal_kb(st, "out", lo, hi)
-    text = (_head(st, "Окно вылета")
-            + "Выберите дату начала окна вылета в календаре "
-              "(листайте месяцы и годы стрелками). 🔴 — выходные и "
-              "праздники производственного календаря РФ.")
+    text = (_head(st, "Выбор даты полёта «туда»")
+            + "Выберите дату вылета в календаре (листайте месяцы и годы "
+              "стрелками). 🔴 — выходные и праздники производственного "
+              "календаря РФ."
+            + _horizon_note(hi))
     return _msg(text, kb)
 
 
 def _cal_kb(st, scope: str, lo, hi) -> dict:
-    """Клавиатура календаря блока + кнопки «оставить» (edit/отсечка)."""
+    """Клавиатура календаря блока + кнопки «оставить» (edit/отсечка).
+
+    Для out/ret навигация разрешена чуть дальше горизонта (nav_hi),
+    чтобы даты за лимитом 400 дней были видны в календаре (✖).
+    """
+    nav_hi = hi + timedelta(days=62) if scope in ("out", "ret") else hi
     kb = ui.month_kb(scope, st["ui"].get("y", lo.year),
                      st["ui"].get("m", lo.month), lo, hi,
-                     selected=_cal_selected(st, scope))
+                     selected=_cal_selected(st, scope), nav_hi=nav_hi)
     rows = kb["inline_keyboard"]
     if scope == "cut":
         prop = _cutoff_proposal(st)
-        rows.append([{"text": f"✅ Оставить {_d(prop.isoformat())}",
+        rows.append([{"text": f"✅ Оставить {_ddw(prop)}",
                       "callback_data": "d|cut|keep"}])
         if st.get("edit") and _cur(st, "cutoff"):
             rows.append([{"text": f"⏭ Оставить прежнюю "
-                                  f"({_d(_cur(st, 'cutoff'))}) и цену",
+                                  f"({_ddw(_cur(st, 'cutoff'))}) и цену",
                           "callback_data": "d|keep|cut"}])
     elif scope == "out" and st.get("edit") and \
             (_cur(st, "out") or {}).get("from"):
         rows.append([{"text": f"⏭ Оставить дату "
-                              f"{_d(_cur(st, 'out')['from'])}",
+                              f"{_ddw(_cur(st, 'out')['from'])}",
                       "callback_data": "d|keep|outdate"}])
     elif scope == "ret" and st.get("edit") and \
             (_cur(st, "ret") or {}).get("from"):
         rows.append([{"text": f"⏭ Оставить дату "
-                              f"{_d(_cur(st, 'ret')['from'])}",
+                              f"{_ddw(_cur(st, 'ret')['from'])}",
                       "callback_data": "d|keep|retdate"}])
     return kb
 
 
 def _days_kb(wkey: str, st) -> dict:
-    rows = [[{"text": f"{n} " + ("день" if n == 1 else "дня" if n < 5 else "дней"),
-              "callback_data": f"d|days|{wkey}|{n}"}] for n in (1, 2, 3, 4)]
+    """Кнопки-диапазоны: «только <дата>», «<дата> – <дата+1>» и т.д."""
     w = _cur(st, wkey) or {}
+    d0 = date.fromisoformat(w["from"]) if w.get("from") else date.today()
+    rows = []
+    for n in (1, 2, 3, 4):
+        d1 = d0 + timedelta(days=n - 1)
+        lbl = (f"только {_ddw(d0)}" if n == 1
+               else f"{_ddw(d0)} – {_ddw(d1)}")
+        rows.append([{"text": lbl, "callback_data": f"d|days|{wkey}|{n}"}])
     if st.get("edit") and w.get("days"):
         blk = f"{wkey}days"
-        rows.append([{"text": f"⏭ Оставить {_days_word(int(w['days']))}",
+        rows.append([{"text": f"⏭ Оставить {_win_range(w)}",
                       "callback_data": f"d|keep|{blk}"}])
     return {"inline_keyboard": rows}
 
@@ -432,10 +489,11 @@ def _days_kb(wkey: str, st) -> dict:
 def _q_days(st, wkey) -> dict:
     noun = "вылета" if wkey == "out" else "возврата"
     w = _cur(st, wkey) or {}
-    d0 = _d(w["from"]) if w.get("from") else ""
-    text = (_head(st, f"Окно {noun}")
-            + f"Дата начала: <b>{d0}</b>. Сколько дней подряд считать "
-              f"окном {noun} от этой даты?")
+    d0 = _ddw(w["from"]) if w.get("from") else ""
+    text = (_head(st, f"Гибкая настройка времени {noun}")
+            + f"Ваша дата {noun}: <b>{d0}</b>.\n"
+              "Выберите, насколько можно сдвинуть дату, — бот будет "
+              "следить за всеми датами выбранного периода.")
     return _msg(text, _days_kb(wkey, st))
 
 
@@ -453,10 +511,10 @@ def _time_ask_kb(wkey: str, st) -> dict:
 
 def _q_time_ask(st, wkey) -> dict:
     noun = "вылета" if wkey == "out" else "возврата"
-    return _msg(_head(st, f"Окно {noun}")
-                + "Время суток вылета: по умолчанию рассматриваются все "
-                  "рейсы суток (с 00:00 до 23:59). Можно оставить как "
-                  "есть или настроить границы.",
+    return _msg(_head(st, f"Время {noun}")
+                + "Время суток: по умолчанию рассматриваются все рейсы "
+                  "суток (с 00:00 до 23:59). Можно оставить как есть или "
+                  "настроить границы.",
                 _time_ask_kb(wkey, st))
 
 
@@ -487,20 +545,43 @@ def _clk_prefill(st, scope: str) -> str:
 
 
 def _open_clock(st, scope: str) -> dict:
-    st.setdefault("ui", {})["buf"] = _clk_prefill(st, scope)
+    ui_ = st.setdefault("ui", {})
+    ui_.pop("buf", None)
+    ui_.pop("clk", None)
+    _clk_state(st, scope)          # инициализация полей из предзаполнения
     st["st"] = {"out_t1": "out_clk1", "out_t2": "out_clk2",
                 "ret_t1": "ret_clk1", "ret_t2": "ret_clk2",
                 "dig_time": "dig_clk"}[scope]
     return _q_clock(st, scope)
 
 
+def _clk_state(st, scope: str) -> dict:
+    """Состояние часов {"h","m","f"}; совместимо со старым buf-строкой."""
+    ui_ = st.setdefault("ui", {})
+    c = ui_.get("clk")
+    if isinstance(c, dict) and "h" in c and "m" in c and "f" in c:
+        c["f"] = c["f"] if c["f"] in ("h", "m") else "h"
+        return c
+    buf = str(ui_.get("buf") or "")
+    if not buf:
+        buf = _clk_prefill(st, scope)
+    buf = "".join(ch for ch in buf if ch.isdigit())[:4]
+    c = {"h": buf[:2], "m": buf[2:4],
+         "f": ("m" if len(buf) >= 2 else "h") if ui_.get("buf") else "h"}
+    ui_["clk"] = c
+    ui_.pop("buf", None)
+    return c
+
+
 def _q_clock(st, scope: str) -> dict:
-    buf = (st.get("ui") or {}).get("buf") or _clk_prefill(st, scope)
-    st.setdefault("ui", {})["buf"] = buf
-    body = (f"{_CLK_TITLE[scope]}: {ui.clock_face(buf)}\n"
-            "Наберите время кнопками и нажмите «Готово» — или отправьте "
-            "четыре цифры текстом, например «1057» (это 10:57).")
-    return _msg(_head(st, "Время") + body, ui.clock_kb(scope))
+    c = _clk_state(st, scope)
+    body = (f"{_CLK_TITLE[scope]}: {ui.clock_face(c)}\n"
+            "Набирайте цифры: после двух цифр ввод переходит к минутам; "
+            "если поле заполнено, новая цифра затирает его и набор "
+            "начинается заново. Тап по [часы]/[минуты] переключает поле. "
+            "Или отправьте время текстом: «1057» или «10:57» — целиком; "
+            "«9» или «37» — записать в активное поле.")
+    return _msg(_head(st, "Время") + body, ui.clock_kb(scope, c))
 
 
 def _clock_ok(st, scope: str, hhmm: str):
@@ -536,6 +617,12 @@ def _h_cal(db, crypto, uid, st, scope: str, arg: str):
     except ValueError:
         return {"msgs": [_msg("Некорректная дата.")], "edit": False}
     if not (lo <= d <= hi):
+        if scope in ("out", "ret") and d > hi:
+            opens = d - timedelta(days=_MAX_HORIZON_DAYS)
+            return {"msgs": [], "edit": False,
+                    "toast": f"Билеты продаются максимум на {_MAX_HORIZON_DAYS} "
+                             f"дней вперёд — дата {_ddw(d)} откроется "
+                             f"{_ddw(opens)}."}
         return {"msgs": [], "toast": "Дата вне допустимого интервала",
                 "edit": False}
     if scope == "out":
@@ -544,7 +631,7 @@ def _h_cal(db, crypto, uid, st, scope: str, arg: str):
                               "t1": w.get("t1"), "t2": w.get("t2")}
         st["st"] = "out_days"
         _save(db, crypto, uid, st)
-        echo = _ok(f"дата начала окна вылета — {d:%d.%m.%Y}")
+        echo = _ok(f"дата вылета — {_ddw(d)}")
         m = _q_days(st, "out")
         m["text"] = echo + "\n\n" + m["text"]
         return {"msgs": [m], "edit": True}
@@ -554,7 +641,7 @@ def _h_cal(db, crypto, uid, st, scope: str, arg: str):
                               "t1": w.get("t1"), "t2": w.get("t2")}
         st["st"] = "ret_days"
         _save(db, crypto, uid, st)
-        echo = _ok(f"дата начала окна возврата — {d:%d.%m.%Y}")
+        echo = _ok(f"дата возврата — {_ddw(d)}")
         m = _q_days(st, "ret")
         m["text"] = echo + "\n\n" + m["text"]
         return {"msgs": [m], "edit": True}
@@ -562,7 +649,7 @@ def _h_cal(db, crypto, uid, st, scope: str, arg: str):
     st["draft"]["cutoff"] = d.isoformat()
     _save(db, crypto, uid, st)
     return {"msgs": [], "edit": True, "fetch": True,
-            "echo": _ok(f"дата отсечки — {d:%d.%m.%Y}"),
+            "echo": _ok(f"дата отсечки — {_ddw(d)}"),
             "draft": st["draft"]}
 
 
@@ -572,10 +659,10 @@ def _h_days(db, crypto, uid, st, wkey: str, n: int):
     st["draft"][wkey] = w
     st["st"] = f"{wkey}_time_ask"
     _save(db, crypto, uid, st)
-    d0, d1 = _win_dates(w)
     noun = "вылета" if wkey == "out" else "возврата"
-    echo = _ok(f"окно {noun} — {_days_word(n)} "
-               f"({_d(d0.isoformat())}–{_d(d1.isoformat())})")
+    what = (_ddw(_win_dates(w)[0]) if n == 1 else
+            f"период {noun} ({_days_word(n)}) — {_win_range(w)}")
+    echo = _ok(what)
     m = _q_time_ask(st, wkey)
     m["text"] = echo + "\n\n" + m["text"]
     return {"msgs": [m], "edit": True}
@@ -622,9 +709,10 @@ def _q_ret_date(st) -> dict:
         d = date.fromisoformat(base) if base else date.today()
         st.setdefault("ui", {})["y"], st["ui"]["m"] = d.year, d.month
     kb = _cal_kb(st, "ret", lo, hi)
-    text = (_head(st, "Окно возврата")
-            + "Выберите дату начала окна возврата (не раньше окончания "
-              "окна вылета). 🔴 — выходные и праздники.")
+    text = (_head(st, "Выбор даты полёта «обратно»")
+            + "Выберите дату возврата (не раньше окончания периода "
+              "вылета). 🔴 — выходные и праздники."
+            + _horizon_note(hi))
     return _msg(text, kb)
 
 
@@ -646,9 +734,9 @@ def _q_cutoff(st) -> dict:
     text = (_head(st, "Отсечка и целевая цена")
             + "<b>Дата отсечки</b> — до какой даты билет нужно купить "
               "в любом случае (даже если цена не упадёт). Предлагаю "
-              f"<b>{_d(prop.isoformat())}</b> — за 14 дней до начала окна "
-              "вылета, но не раньше сегодняшнего дня. Выберите другую "
-              "дату в календаре или оставьте предложенную.")
+              f"<b>{_ddw(prop)}</b> — за 14 дней до даты вылета, но не "
+              "раньше сегодняшнего дня. Выберите другую дату в календаре "
+              "или оставьте предложенную.")
     return _msg(text, kb)
 
 
@@ -658,7 +746,7 @@ def _h_cutoff(db, crypto, uid, st, keep: bool):
                              else _cutoff_proposal(st).isoformat())
     _save(db, crypto, uid, st)
     return {"msgs": [], "edit": True, "fetch": True,
-            "echo": _ok(f"дата отсечки — {_d(st['draft']['cutoff'])}",
+            "echo": _ok(f"дата отсечки — {_ddw(st['draft']['cutoff'])}",
                         kept=bool(keep and prev)),
             "draft": st["draft"]}
 
@@ -733,20 +821,20 @@ def _summary_text(t: dict) -> str:
     w = t.get("out") or {}
     if w.get("from"):
         d0, d1 = _win_dates(w)
-        win = (f"{d0:%d.%m.%Y}, {w.get('t1')}–{w.get('t2')}"
+        win = (f"{_ddw(d0)}, {w.get('t1')}–{w.get('t2')}"
                if int(w.get("days") or 1) == 1 else
-               f"{d0:%d.%m.%Y} ({w.get('t1')}) – "
-               f"{d1:%d.%m.%Y} ({w.get('t2')})")
-        out.append(f"4. Окно вылета: {win}")
+               f"{_ddw(d0)} ({w.get('t1')}) – "
+               f"{_ddw(d1)} ({w.get('t2')})")
+        out.append(f"4. Полёт «туда»: {win}")
     r = t.get("ret")
     if not t.get("oneway") and r and r.get("from"):
         d0, d1 = _win_dates(r)
-        win = (f"{d0:%d.%m.%Y}, {r.get('t1')}–{r.get('t2')}"
+        win = (f"{_ddw(d0)}, {r.get('t1')}–{r.get('t2')}"
                if int(r.get("days") or 1) == 1 else
-               f"{d0:%d.%m.%Y} ({r.get('t1')}) – "
-               f"{d1:%d.%m.%Y} ({r.get('t2')})")
-        out.append(f"5. Окно возврата: {win}")
-    out.append(f"6. Дата отсечки (купить обязательно): {_d(t['cutoff'])}")
+               f"{_ddw(d0)} ({r.get('t1')}) – "
+               f"{_ddw(d1)} ({r.get('t2')})")
+        out.append(f"5. Полёт «обратно»: {win}")
+    out.append(f"6. Дата отсечки (купить обязательно): {_ddw(t['cutoff'])}")
     out.append(f"   Целевая цена: {_target_word(t.get('target'))}")
     out.append(f"7. Дайджест: {_every_word(t.get('digest_every', 1))} в "
                f"{t.get('digest_time', '09:00')} МСК")
@@ -757,19 +845,22 @@ def summary_msg(st) -> dict:
     t = dict(st["draft"])
     t.setdefault("digest_every", 1)
     t.setdefault("digest_time", "09:00")
-    kb = {"inline_keyboard": [
-        [{"text": "✅ Подтвердить", "callback_data": "d|sum|yes"}],
-        [{"text": "✏️ Изменить", "callback_data": "d|sum|edit"}]]}
-    return _msg(_summary_text(t), kb)
+    rows = [[{"text": "✅ Подтвердить", "callback_data": "d|sum|yes"}],
+            [{"text": "✏️ Изменить", "callback_data": "d|sum|edit"}]]
+    rows.append([{"text": ("🚪 Выйти без изменений" if st.get("edit")
+                           else "🚪 Отменить настройку"),
+                  "callback_data": "d|exit"}])
+    return _msg(_summary_text(t), {"inline_keyboard": rows})
 
 
 def _editmenu_kb(st) -> dict:
     rows = [[{"text": "1️⃣ Город вылета", "callback_data": "d|jump|cf"},
              {"text": "2️⃣ Город прилёта", "callback_data": "d|jump|ct"}],
             [{"text": "3️⃣ Тип поездки", "callback_data": "d|jump|trip"},
-             {"text": "4️⃣ Окно вылета", "callback_data": "d|jump|out"}]]
+             {"text": "4️⃣ Дата и время «туда»",
+              "callback_data": "d|jump|out"}]]
     if not _cur(st, "oneway"):
-        rows.append([{"text": "5️⃣ Окно возврата",
+        rows.append([{"text": "5️⃣ Дата и время «обратно»",
                       "callback_data": "d|jump|ret"}])
     rows.append([{"text": "6️⃣ Отсечка и цена", "callback_data": "d|jump|cut"},
                  {"text": "7️⃣ Дайджест", "callback_data": "d|jump|dig"}])
@@ -826,24 +917,24 @@ def _keep(db, crypto, uid, st, blk: str):
            "retdate": ("ret_days", None), "retdays": ("ret_time_ask", None),
            "rettime": ("cutoff", None), "cut": ("digest", None),
            "target": ("digest", None), "dig": ("summary", None)}
+    w_out = _cur(st, "out") or {}
+    w_ret = _cur(st, "ret") or {}
     labels = {"cf": f"город вылета — {_cur(st, 'origin_name')}",
               "ct": f"город прилёта — {_cur(st, 'dest_name')}",
               "trip": f"тип поездки — {_trip_word(_cur(st, 'oneway'))}",
-              "outdate": f"дата окна вылета — "
-                         f"{_d((_cur(st,'out') or {}).get('from'))}",
-              "outdays": f"длительность окна вылета — "
-                         f"{_days_word(int((_cur(st,'out') or {}).get('days') or 1))}",
+              "outdate": f"дата вылета — "
+                         f"{_ddw((_cur(st, 'out') or {}).get('from'))}",
+              "outdays": "гибкость вылета — "
+                         + (_win_range(w_out) if w_out.get("from") else "—"),
               "outtime": f"время вылета — "
-                         f"{(_cur(st,'out') or {}).get('t1')}–"
-                         f"{(_cur(st,'out') or {}).get('t2')}",
-              "retdate": f"дата окна возврата — "
-                         f"{_d((_cur(st,'ret') or {}).get('from'))}",
-              "retdays": f"длительность окна возврата — "
-                         f"{_days_word(int((_cur(st,'ret') or {}).get('days') or 1))}",
+                         f"{w_out.get('t1')}–{w_out.get('t2')}",
+              "retdate": f"дата возврата — "
+                         f"{_ddw((_cur(st, 'ret') or {}).get('from'))}",
+              "retdays": "гибкость возврата — "
+                         + (_win_range(w_ret) if w_ret.get("from") else "—"),
               "rettime": f"время возврата — "
-                         f"{(_cur(st,'ret') or {}).get('t1')}–"
-                         f"{(_cur(st,'ret') or {}).get('t2')}",
-              "cut": f"отсечка и цена — {_d(_cur(st, 'cutoff'))}, "
+                         f"{w_ret.get('t1')}–{w_ret.get('t2')}",
+              "cut": f"отсечка и цена — {_ddw(_cur(st, 'cutoff'))}, "
                      f"{_target_word(_cur(st, 'target'))}",
               "target": f"целевая цена — {_target_word(_cur(st, 'target'))}",
               "dig": f"дайджест — {_every_word(_cur(st, 'digest_every') or 1)} "
@@ -924,7 +1015,8 @@ def cb(db, crypto, uid: str, data: str):
             return _h_cal(db, crypto, uid, st, parts[2], parts[3])
         if act == "days":
             if parts[3] not in ("1", "2", "3", "4"):
-                return {"msgs": [], "toast": "Окно — 1, 2, 3 или 4 дня",
+                return {"msgs": [], "toast": "Выберите один из вариантов — "
+                                "период от 1 до 4 дней",
                         "edit": False}
             return _h_days(db, crypto, uid, st, parts[2], int(parts[3]))
         if act == "tall":
@@ -969,6 +1061,14 @@ def cb(db, crypto, uid: str, data: str):
                 return {"msgs": [summary_msg(st)], "edit": True}
         if act == "jump":
             return _jump(db, crypto, uid, st, parts[2])
+        if act == "exit":
+            row = db.get_user(uid)
+            had = bool(row and row["tracking_enc"])
+            _save(db, crypto, uid, None)
+            msg = ("Изменения отменены — отслеживание работает, как "
+                   "раньше. Сводка: /status." if had else
+                   "Настройка прервана. /watch — начать заново.")
+            return {"msgs": [_msg(msg)], "edit": True}
         if act == "stop":
             return _h_stop(db, crypto, uid, st, parts[2])
     except Exception as e:  # защита от каскада ошибок в диалоге
@@ -1032,19 +1132,27 @@ def _h_tgt(db, crypto, uid, st, val: str):
 
 
 def _h_clk(db, crypto, uid, st, scope: str, tok: str):
-    """Нажатие кнопок часов: цифра, ⌫, Готово."""
-    buf = (st.get("ui") or {}).get("buf") or ""
+    """Кнопки часов: поля [ЧЧ]/[ММ] (переключение), цифра, ⌫, Готово."""
+    c = _clk_state(st, scope)
+    if tok in ("fh", "fm"):            # тап по полю — переключить его
+        c["f"] = tok[1]
+        _save(db, crypto, uid, st)
+        return {"msgs": [_q_clock(st, scope)], "edit": True}
     if tok == "del":
-        st["ui"]["buf"] = buf[:-1]
+        f = c["f"]
+        c[f] = (c[f] or "")[:-1]
+        if not c[f]:
+            c["f"] = "h"
         _save(db, crypto, uid, st)
         return {"msgs": [_q_clock(st, scope)], "edit": True}
     if tok == "ok":
-        if len(buf) < 4:
-            return {"msgs": [], "toast": "Введите 4 цифры: часы и минуты",
+        if len(c["h"]) < 2 or len(c["m"]) < 2:
+            return {"msgs": [], "toast": "Заполните обе части: часы и минуты",
                     "edit": False}
-        hhmm = f"{buf[:2]}:{buf[2:]}"
+        hhmm = f"{c['h']}:{c['m']}"
         if not parse_time(hhmm):
-            st["ui"]["buf"] = ""  # чистый экран — ввод заново
+            c["h"] = c["m"] = ""
+            c["f"] = "h"
             _save(db, crypto, uid, st)
             return {"msgs": [_q_clock(st, scope)],
                     "toast": f"Некорректное время: {hhmm}. Введите заново",
@@ -1053,36 +1161,45 @@ def _h_clk(db, crypto, uid, st, scope: str, tok: str):
         if wkey and scope.endswith("t2"):
             err = _t2_relation_error(st, wkey, hhmm)
             if err:
-                st["ui"]["buf"] = ""
+                c["h"] = c["m"] = ""
+                c["f"] = "h"
                 _save(db, crypto, uid, st)
                 return {"msgs": [], "toast": err + " Введите время заново",
                         "edit": False}
         _clock_ok(st, scope, hhmm)
         return _clock_next(db, crypto, uid, st, scope, hhmm)
-    # цифра
-    if len(buf) < 4:
-        st["ui"]["buf"] = buf + tok
+    # цифра: в заполненное поле — затирание (поле начинается заново)
+    f = c["f"]
+    cur = c[f] or ""
+    if len(cur) >= 2:
+        cur = ""
+    cur += tok
+    if len(cur) == 2 and int(cur) > (23 if f == "h" else 59):
+        c[f] = ""
         _save(db, crypto, uid, st)
-        return {"msgs": [_q_clock(st, scope)], "edit": True}
-    return {"msgs": [], "toast": "Уже 4 цифры — нажмите «Готово»",
-            "edit": False}
+        return {"msgs": [_q_clock(st, scope)],
+                "toast": ("Часы — от 00 до 23" if f == "h"
+                          else "Минуты — от 00 до 59"),
+                "edit": True}
+    c[f] = cur
+    if len(cur) == 2 and f == "h":
+        c["f"] = "m"          # авто-переход к минутам
+    _save(db, crypto, uid, st)
+    return {"msgs": [_q_clock(st, scope)], "edit": True}
 
 
 def _clock_next(db, crypto, uid, st, scope: str, hhmm: str):
     what = _CLK_TITLE[scope]
     echo = _ok(f"{what} — {hhmm}")
-    if scope == "out_t1":
-        st["st"] = "out_clk2"
-        st["ui"]["buf"] = _clk_prefill(st, "out_t2")
+    if scope in ("out_t1", "ret_t1"):
+        nxt = "out_clk2" if scope == "out_t1" else "ret_clk2"
+        nxt_scope = "out_t2" if scope == "out_t1" else "ret_t2"
+        st["st"] = nxt
+        st.setdefault("ui", {}).pop("buf", None)
+        st["ui"].pop("clk", None)      # чистые поля: предзаполнение t2
+        _clk_state(st, nxt_scope)
         _save(db, crypto, uid, st)
-        m = _q_clock(st, "out_t2")
-        m["text"] = echo + "\n\n" + m["text"]
-        return {"msgs": [m], "edit": True}
-    if scope == "ret_t1":
-        st["st"] = "ret_clk2"
-        st["ui"]["buf"] = _clk_prefill(st, "ret_t2")
-        _save(db, crypto, uid, st)
-        m = _q_clock(st, "ret_t2")
+        m = _q_clock(st, nxt_scope)
         m["text"] = echo + "\n\n" + m["text"]
         return {"msgs": [m], "edit": True}
     if scope == "out_t2":
@@ -1157,18 +1274,33 @@ def feed(db, crypto, uid: str, text: str):
         if state in ("out_clk1", "out_clk2", "ret_clk1", "ret_clk2",
                      "dig_clk"):
             scope = _CLK_SCOPE[state]
-            t = parse_time_text(text)
-            if not t:
-                return [_msg("Не понял время. Отправьте 4 цифры "
-                             "(например «1057» — это 10:57) или ЧЧ:ММ "
-                             "(часы 00–23, минуты 00–59).")]
-            wkey, _ = _CLK_DRAFT[scope]
-            if wkey and scope.endswith("t2"):
-                err = _t2_relation_error(st, wkey, t)
-                if err:
-                    return [_msg(err + " Повторите ввод.")]
-            _clock_ok(st, scope, t)
-            return _pack(_clock_next(db, crypto, uid, st, scope, t))
+            c = _clk_state(st, scope)
+            s = (text or "").strip()
+            t = parse_time_text(s)
+            if t:
+                wkey, _ = _CLK_DRAFT[scope]
+                if wkey and scope.endswith("t2"):
+                    err = _t2_relation_error(st, wkey, t)
+                    if err:
+                        return [_msg(err + " Повторите ввод.")]
+                _clock_ok(st, scope, t)
+                return _pack(_clock_next(db, crypto, uid, st, scope, t))
+            if s.isdigit() and 1 <= len(s) <= 2:
+                # затирание активного поля: «9» -> 09, «37» -> 37
+                v = s.zfill(2)
+                f = c["f"]
+                lim = 23 if f == "h" else 59
+                if int(v) > lim:
+                    return [_msg(f"{'Часы' if f == 'h' else 'Минуты'} — "
+                                 f"от 00 до {lim}. Повторите ввод.")]
+                c[f] = v
+                if f == "h":
+                    c["f"] = "m"
+                _save(db, crypto, uid, st)
+                return [_q_clock(st, scope)]
+            return [_msg("Не понял время. Отправьте «1057» или «10:57» "
+                         "(целиком), либо 1–2 цифры — записать в активное "
+                         "поле (часы 00–23, минуты 00–59).")]
         if state == "target_manual":
             t = (text or "").strip().lower()
             if t in ("выкл", "0"):

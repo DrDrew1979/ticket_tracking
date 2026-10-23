@@ -6,12 +6,17 @@
 
 Календарь: понедельник — первый день недели; суббота/воскресенье и
 нерабочие праздничные дни (производственный календарь РФ, src/holidays.py)
-помечаются 🔴; листание по месяцам и годам стрелками; дни вне допустимого
-интервала не нажимаются («·»).
+помечаются 🔴; листание по месяцам и годам стрелками (до nav_hi — чуть
+дальше горизонта, чтобы «закрытые» даты были видны); дни вне интервала
+[lo..hi] не выбираются: прошлые показываются «·», а даты за горизонтом
+400 дней — «✖» и нажимаются с пояснением (toast рисует dialog.py).
 
-Часы: буфер из 4 цифр в состоянии диалога; экран показывает ЧЧ:ММ с
-незаполненными позициями «_»; кнопки 0–9, ⌫ и «Готово». Текстом можно
-ввести «1057» или «10:57» — парсит dialog.parse_time_text().
+Часы: ДВА поля по две цифры — [ЧЧ]:[ММ] (как табло цифровых часов).
+Поле заменяет цифры заново при переполнении (затирание), после двух
+цифр ввод переходит к минутам, тап по полю переключает его. Состояние:
+{"h": "09", "m": "37", "f": "h"|"m"} в ui диалога. Текстом можно ввести
+«1057» или «10:57» целиком — парсит dialog.parse_time_text(); одна-две
+цифры текстом перезаписывают активное поле.
 """
 from datetime import date, timedelta
 
@@ -25,9 +30,9 @@ CLK = "d|clk|{scope}|{tok}"         # кнопки часов
 NOOP = "d|noop"
 
 
-def _clamp_month(y: int, m: int, lo: date, hi: date) -> tuple[int, int]:
+def _clamp_month(y: int, m: int, lo: date, nav_hi: date) -> tuple[int, int]:
     lo_y, lo_m = lo.year, lo.month
-    hi_y, hi_m = hi.year, hi.month
+    hi_y, hi_m = nav_hi.year, nav_hi.month
     if (y, m) < (lo_y, lo_m):
         return lo_y, lo_m
     if (y, m) > (hi_y, hi_m):
@@ -36,12 +41,15 @@ def _clamp_month(y: int, m: int, lo: date, hi: date) -> tuple[int, int]:
 
 
 def month_kb(scope: str, y: int, m: int, lo: date, hi: date,
-             selected: str | None = None) -> dict:
+             selected: str | None = None, nav_hi: date | None = None) -> dict:
     """Клавиатура одного месяца. scope: out | ret | cut.
 
-    Навигация: «‹‹ год ››» и «‹ месяц ›», обрезаны по [lo..hi].
+    Навигация обрезана по [lo..nav_hi] (nav_hi по умолчанию = hi), но
+    дни валидны только в [lo..hi]: даты позже hi показываются «✖» и
+    нажимаются с пояснением, дни раньше lo — «·» (неактивны).
     """
-    y, m = _clamp_month(y, m, lo, hi)
+    nav_hi = nav_hi or hi
+    y, m = _clamp_month(y, m, lo, nav_hi)
     cur = date(y, m, 1)
     rows: list[list[dict]] = []
 
@@ -52,12 +60,12 @@ def month_kb(scope: str, y: int, m: int, lo: date, hi: date,
 
     def year_row():
         btns = []
-        # год показываем, только если он пересекается с [lo..hi]
+        # год показываем, только если он пересекается с [lo..nav_hi]
         if year_prev.replace(month=12, day=31) >= lo:
             btns.append({"text": f"‹‹ {year_prev.year}",
                          "callback_data": CB.format(
                              scope=scope, arg=year_prev.strftime("%Y-%m"))})
-        if year_next.replace(month=1, day=1) <= hi:
+        if year_next.replace(month=1, day=1) <= nav_hi:
             btns.append({"text": f"{year_next.year} ››",
                          "callback_data": CB.format(
                              scope=scope, arg=year_next.strftime("%Y-%m"))})
@@ -74,7 +82,7 @@ def month_kb(scope: str, y: int, m: int, lo: date, hi: date,
                          scope=scope, arg=prev_m.strftime("%Y-%m"))})
     mrow.append({"text": f"{MONTHS[m - 1].capitalize()} {y}",
                  "callback_data": NOOP})
-    if next_m <= hi:
+    if next_m <= nav_hi:
         mrow.append({"text": "›",
                      "callback_data": CB.format(
                          scope=scope, arg=next_m.strftime("%Y-%m"))})
@@ -88,15 +96,23 @@ def month_kb(scope: str, y: int, m: int, lo: date, hi: date,
         week.append({"text": "·", "callback_data": NOOP})
     for day in range(1, ndays + 1):
         d = date(y, m, day)
-        if d < lo or d > hi:
+        if d < lo:
             week.append({"text": "·", "callback_data": NOOP})
             continue
-        mark = "🔴" if H.is_nonworking(d) else ""
         if selected and d.isoformat() == selected:
-            mark = "✅"
-        week.append({"text": f"{mark}{day}",
-                     "callback_data": CB.format(
-                         scope=scope, arg=d.isoformat())})
+            week.append({"text": f"✅{day}",
+                         "callback_data": CB.format(
+                             scope=scope, arg=d.isoformat())})
+        elif d > hi:
+            # за горизонтом (400 дней) — видна, но не выбирается
+            week.append({"text": f"✖{day}",
+                         "callback_data": CB.format(
+                             scope=scope, arg=d.isoformat())})
+        else:
+            mark = "🔴" if H.is_nonworking(d) else ""
+            week.append({"text": f"{mark}{day}",
+                         "callback_data": CB.format(
+                             scope=scope, arg=d.isoformat())})
         if len(week) == 7:
             rows.append(week)
             week = []
@@ -107,10 +123,19 @@ def month_kb(scope: str, y: int, m: int, lo: date, hi: date,
     return {"inline_keyboard": rows}
 
 
-def clock_kb(scope: str) -> dict:
-    """Цифровые часы: буфер живёт в состоянии диалога, экран — в тексте."""
+def clock_kb(scope: str, c: dict | None = None) -> dict:
+    """Цифровые часы: экран-поля [ЧЧ]:[ММ], тап по полю переключает его."""
+    c = c or {"h": "", "m": "", "f": "h"}
     tok = lambda t: CLK.format(scope=scope, tok=t)  # noqa: E731
-    rows = [[{"text": str(n), "callback_data": tok(n)} for n in (1, 2, 3)],
+
+    def field(f: str) -> str:
+        v = (c.get(f) or "").ljust(2, "_")[:2]
+        return f"▶ {v} ◂" if c.get("f") == f else f"[ {v} ]"
+
+    rows = [[{"text": field("h"), "callback_data": tok("fh")},
+             {"text": ":", "callback_data": NOOP},
+             {"text": field("m"), "callback_data": tok("fm")}],
+            [{"text": str(n), "callback_data": tok(n)} for n in (1, 2, 3)],
             [{"text": str(n), "callback_data": tok(n)} for n in (4, 5, 6)],
             [{"text": str(n), "callback_data": tok(n)} for n in (7, 8, 9)],
             [{"text": "⌫", "callback_data": tok("del")},
@@ -119,12 +144,14 @@ def clock_kb(scope: str) -> dict:
     return {"inline_keyboard": rows}
 
 
-def clock_face(buf: str) -> str:
-    """Экран часов: '10' -> «10 : __», '1057' -> «10 : 57»."""
-    buf = (buf or "")[:4]
-    hh = buf[:2].ljust(2, "_")
-    mm = buf[2:].ljust(2, "_")
-    return f"<code>{hh} : {mm}</code>"
+def clock_face(c: dict) -> str:
+    """Экран часов текстом: {'h':'09','m':'37'} -> «[09]:[37]».
+
+    Незаполненная позиция — «_»: {'h':'9'} -> «[9_]:[__]».
+    """
+    h = (c.get("h") or "").ljust(2, "_")[:2]
+    m = (c.get("m") or "").ljust(2, "_")[:2]
+    return f"<code>[{h}]:[{m}]</code>"
 
 
 def cb_days(scope: str, n: int) -> str:

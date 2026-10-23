@@ -182,4 +182,8 @@ def _cutoff_hint(t: dict, bests: list[dict], series_fn) -> str | None:
 
 
 def _d(iso):
-    return f"{date.fromisoformat(iso):%d.%m.%Y}" if iso else "—"
+    if not iso:
+        return "—"
+    d = date.fromisoformat(iso)
+    dow = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][d.weekday()]
+    return f"{d:%d.%m.%Y} {dow}"

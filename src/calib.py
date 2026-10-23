@@ -78,7 +78,7 @@ def calibrate(client, origin: str, dest: str, out_from: str,
     return {
         "min": vals[0], "p25": p25, "p50": p50, "n": n,
         "target_suggest": target_suggest,
-        "note": (f"по кэшу на {n} дат месяца(ев) вокруг вашего окна: "
+        "note": (f"по кэшу на {n} дат месяца(ев) вокруг ваших дат: "
                  f"минимум {vals[0]} ₽, типичная цена {p50} ₽"),
         "calls": 2,
     }
