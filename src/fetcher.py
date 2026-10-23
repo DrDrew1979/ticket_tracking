@@ -27,11 +27,16 @@ class TPClient:
     def fetch_roundtrip(self, origin: str, destination: str,
                         depart_date: str, return_date: str | None = None,
                         currency: str = "rub", limit: int = 15) -> list[dict]:
-        """Список предложений (кэш) по паре дат; return_date=None — one-way."""
+        """Список предложений (кэш) по паре дат; return_date=None — one-way.
+
+        depart_date/return_date — YYYY-MM-DD или YYYY-MM (месяц: кэш по
+        всем датам месяца, используется как фолбэк, если по точным датам
+        в кэше пусто — дальние даты наполняются по мере спроса).
+        """
         params = {
             "origin": origin,
             "destination": destination,
-            "departure_at": depart_date,   # YYYY-MM-DD
+            "departure_at": depart_date,   # YYYY-MM-DD или YYYY-MM
             "direct": "false",             # прямые + с пересадками
             "sorting": "price",
             "order_by": "price",
@@ -40,7 +45,7 @@ class TPClient:
             "token": self.token,
         }
         if return_date:
-            params["return_at"] = return_date      # YYYY-MM-DD
+            params["return_at"] = return_date      # YYYY-MM-DD или YYYY-MM
             params["one_way"] = "false"
         else:
             params["one_way"] = "true"
@@ -56,7 +61,17 @@ class TPClient:
                     time.sleep(15)
                     continue
                 r.raise_for_status()
-                data = r.json().get("data", [])
+                resp = r.json()
+                data = resp.get("data", [])
+                if resp.get("error") or resp.get("success") is False:
+                    # невалидный токен/лимиты API приходят с HTTP 200
+                    log.warning("TP API error (%s->%s, dep=%s): %s",
+                                origin, destination, depart_date,
+                                str(resp)[:200])
+                    return []
+                if not data:
+                    log.info("TP API: кэш пуст (dep=%s, ret=%s, %s->%s)",
+                             depart_date, return_date, origin, destination)
                 return [o for o in data if o.get("price")]
             except requests.RequestException as e:
                 log.warning("Ошибка запроса (%s->%s), попытка %d: %s",

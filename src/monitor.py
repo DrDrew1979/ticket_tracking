@@ -141,8 +141,11 @@ def _user_alert_text(a: dict, t: dict) -> str:
         f"✈️ <b>ЛУЧШАЯ ЦЕНА ЗА 30 ДНЕЙ!</b>\n\n"
         f"💰 <b>{a['price']:,}</b> ₽ (цель ≤ {t.get('target'):,} ₽)"
         .replace(",", " ") +
-        f"\n🛫 {direction}: {_dt(o.get('departure_at'))}\n"
-        + (f"🛬 Обратно: {_dt(o.get('return_at'))}\n" if a.get("ret") else "")
+        f"\n🛫 {direction}: {_dt(o.get('departure_at'))} "
+        f"(местное время {_place_short(t.get('origin_name'))})\n"
+        + (f"🛬 Обратно: {_dt(o.get('return_at'))} "
+           f"(местное время {_place_short(t.get('dest_name'))})\n"
+           if a.get("ret") else "")
         + f"🔁 Пересадки: {tr}"
         + (f" туда / {rtr} обратно" if a.get("ret") else "")
         + f"\n🛩 {o.get('airline', '?')}\n\n"
@@ -152,5 +155,21 @@ def _user_alert_text(a: dict, t: dict) -> str:
     )
 
 
+def _place_short(label: str | None) -> str:
+    """«Россия, Москва (MOW), все аэропорты» -> «Москва»;
+    «Франция, Париж (PAR), все аэропорты» -> «Париж»."""
+    head = (label or "").split("(")[0].strip().rstrip(",")
+    parts = [p.strip() for p in head.split(",") if p.strip()]
+    return parts[-1] if parts else (label or "—")
+
+
 def _dt(iso):
-    return iso.replace("T", " ")[:16] if iso else "?"
+    """ISO с offset'ом аэропорта -> «16.07.2027 20:00» (время местное:
+    API отдаёт departure_at/return_at в часовой зоне аэропорта вылета)."""
+    if not iso:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        return f"{dt:%d.%m.%Y %H:%M}"
+    except ValueError:
+        return str(iso).replace("T", " ")[:16]

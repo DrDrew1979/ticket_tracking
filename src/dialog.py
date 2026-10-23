@@ -17,6 +17,13 @@
 Финальное меню — сводка с кнопками «Подтвердить» и «Изменить» («Изменить»
 открывает меню блоков, правка любого блока с возвратом к проверке).
 
+Часовые пояса: даты и время рейсов — МЕСТНЫЕ, аэропортов вылета и
+возврата (как на билете и на сайте Aviasales). API отдаёт
+departure_at/return_at с offset'ом аэропорта; rules.in_window_time
+сравнивает их с окном пользователя без конвертации — поэтому в текстах
+экранов везде помечаем «местное». Время дайджеста и граница «сегодня» —
+МСК (UTC+3, без перехода на летнее время).
+
 Все выборы — inline-кнопки (editMessageText — одно сообщение редактируется
 на месте). Текстовый ввод остался там, где без него нельзя: названия
 городов, своя цена, время «1057»/«10:57» как дублирующий способ.
@@ -28,7 +35,7 @@
 (dialog_enc в prices.db) — переживает рестарты раннеров.
 """
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from . import holidays  # noqa: F401  (нужен ui.py; импорт для связности)
 from . import places, ui
@@ -62,6 +69,12 @@ def _save(db, crypto, uid, state):
 
 def _cur(st, key):
     return (st.get("draft") or {}).get(key)
+
+
+def _today() -> date:
+    """«Сегодня» по МСК (UTC+3): выбор дат — начиная с дня запуска
+    сессии. UTC-дата раннера могла отставать от московской на день."""
+    return (datetime.utcnow() + timedelta(hours=3)).date()
 
 
 def _d(iso) -> str:
@@ -147,7 +160,7 @@ def parse_date(s: str) -> date | None:
     if not (2 <= len(parts) <= 3) or not all(p.isdigit() for p in parts):
         return None
     d, m = int(parts[0]), int(parts[1])
-    today = date.today()
+    today = _today()
     if len(parts) == 2:
         try:
             dt = date(today.year, m, d)
@@ -199,7 +212,7 @@ def _cal_default_month(st, wkey: str) -> tuple[int, int]:
     d = (_cur(st, wkey) or {}).get("from")
     if not d:
         d = (_cur(st, "out") or {}).get("from")
-    base = date.fromisoformat(d) if d else date.today()
+    base = date.fromisoformat(d) if d else _today()
     return base.year, base.month
 
 
@@ -210,7 +223,7 @@ def _cal_selected(st, scope: str) -> str | None:
 
 
 def _cal_bounds(scope: str, st) -> tuple:
-    today = date.today()
+    today = _today()
     horizon = today + timedelta(days=_MAX_HORIZON_DAYS)
     if scope == "out":
         return today, horizon
@@ -431,8 +444,9 @@ def _q_out_date(st) -> dict:
     kb = _cal_kb(st, "out", lo, hi)
     text = (_head(st, "Выбор даты полёта «туда»")
             + "Выберите дату вылета в календаре (листайте месяцы и годы "
-              "стрелками). 🔴 — выходные и праздники производственного "
-              "календаря РФ."
+              "стрелками). Первый выбираемый день — сегодняшний. "
+              "Даты — местные, аэропорта вылета (как на билете). "
+              "🔴 — выходные и праздники производственного календаря РФ."
             + _horizon_note(hi))
     return _msg(text, kb)
 
@@ -472,7 +486,7 @@ def _cal_kb(st, scope: str, lo, hi) -> dict:
 def _days_kb(wkey: str, st) -> dict:
     """Кнопки-диапазоны: «только <дата>», «<дата> – <дата+1>» и т.д."""
     w = _cur(st, wkey) or {}
-    d0 = date.fromisoformat(w["from"]) if w.get("from") else date.today()
+    d0 = date.fromisoformat(w["from"]) if w.get("from") else _today()
     rows = []
     for n in (1, 2, 3, 4):
         d1 = d0 + timedelta(days=n - 1)
@@ -493,7 +507,9 @@ def _q_days(st, wkey) -> dict:
     text = (_head(st, f"Гибкая настройка времени {noun}")
             + f"Ваша дата {noun}: <b>{d0}</b>.\n"
               "Выберите, насколько можно сдвинуть дату, — бот будет "
-              "следить за всеми датами выбранного периода.")
+              "следить за всеми датами выбранного периода. "
+              f"Даты и время — местные, аэропорта {noun} "
+              "(как на билете).")
     return _msg(text, _days_kb(wkey, st))
 
 
@@ -514,7 +530,8 @@ def _q_time_ask(st, wkey) -> dict:
     return _msg(_head(st, f"Время {noun}")
                 + "Время суток: по умолчанию рассматриваются все рейсы "
                   "суток (с 00:00 до 23:59). Можно оставить как есть или "
-                  "настроить границы.",
+                  "настроить границы.\n"
+                  f"⏰ Время — местное, аэропорта {noun} (как на билете).",
                 _time_ask_kb(wkey, st))
 
 
@@ -575,12 +592,19 @@ def _clk_state(st, scope: str) -> dict:
 
 def _q_clock(st, scope: str) -> dict:
     c = _clk_state(st, scope)
+    wkey, _tkey = _CLK_DRAFT[scope]
+    tz_note = ""
+    if wkey:
+        airport = "вылета" if wkey == "out" else "возврата"
+        tz_note = (f"⏰ Время — местное, аэропорта {airport} "
+                   "(как на билете).\n")
     body = (f"{_CLK_TITLE[scope]}: {ui.clock_face(c)}\n"
-            "Набирайте цифры: после двух цифр ввод переходит к минутам; "
-            "если поле заполнено, новая цифра затирает его и набор "
-            "начинается заново. Тап по [часы]/[минуты] переключает поле. "
-            "Или отправьте время текстом: «1057» или «10:57» — целиком; "
-            "«9» или «37» — записать в активное поле.")
+            + tz_note
+            + "Набирайте цифры: после двух цифр ввод переходит к минутам; "
+              "если поле заполнено, новая цифра затирает его и набор "
+              "начинается заново. Тап по [часы]/[минуты] переключает поле. "
+              "Или отправьте время текстом: «1057» или «10:57» — целиком; "
+              "«9» или «37» — записать в активное поле.")
     return _msg(_head(st, "Время") + body, ui.clock_kb(scope, c))
 
 
@@ -706,12 +730,13 @@ def _q_ret_date(st) -> dict:
         base = (_cur(st, "ret") or {}).get("from")
         if not base and out.get("from"):
             base = _win_dates(out)[1].isoformat()
-        d = date.fromisoformat(base) if base else date.today()
+        d = date.fromisoformat(base) if base else _today()
         st.setdefault("ui", {})["y"], st["ui"]["m"] = d.year, d.month
     kb = _cal_kb(st, "ret", lo, hi)
     text = (_head(st, "Выбор даты полёта «обратно»")
             + "Выберите дату возврата (не раньше окончания периода "
-              "вылета). 🔴 — выходные и праздники."
+              "вылета). Даты — местные, аэропорта возврата (как на "
+              "билете). 🔴 — выходные и праздники."
             + _horizon_note(hi))
     return _msg(text, kb)
 
@@ -721,8 +746,8 @@ def _q_ret_date(st) -> dict:
 def _cutoff_proposal(st) -> date:
     out = _cur(st, "out") or {}
     dep = date.fromisoformat(out["from"]) if out.get("from") else \
-        date.today() + timedelta(days=14)
-    return max(date.today(), dep - timedelta(days=14))
+        _today() + timedelta(days=14)
+    return max(_today(), dep - timedelta(days=14))
 
 
 def _q_cutoff(st) -> dict:
@@ -774,10 +799,13 @@ def _q_target(st) -> dict:
                 "минимума: как только цена станет равна или ниже цели, "
                 "пришлю мгновенное уведомление.")
     else:
-        body = ("Не смог получить текущие цены (кэш недоступен). "
-                "Задайте целевую цену вручную или продолжите без неё — "
-                "уведомления по цене будут выключены, дайджест продолжит "
-                "приходить.")
+        body = ("🛰 По этим датам в кэше Aviasales сейчас нет данных: "
+                "кэш наполняется по мере спроса, и по дальним/редким "
+                "направлениям он может быть пуст (возможен и краткий "
+                "сбой API). Это НЕ мешает слежению: статистика маршрута "
+                "собирается независимо. Задайте целевую цену вручную или "
+                "продолжите без неё — уведомления по цене сработают, как "
+                "только появятся данные.")
     rows = []
     if sug:
         rows.append([{"text": f"✅ {_rub(sug)} (−15%)",
@@ -834,6 +862,9 @@ def _summary_text(t: dict) -> str:
                f"{_ddw(d0)} ({r.get('t1')}) – "
                f"{_ddw(d1)} ({r.get('t2')})")
         out.append(f"5. Полёт «обратно»: {win}")
+    out.append("⏰ Даты и время — местные, аэропортов вылета и возврата "
+               "(как на билете)" if not t.get("oneway") else
+               "⏰ Даты и время — местные, аэропорта вылета (как на билете)")
     out.append(f"6. Дата отсечки (купить обязательно): {_ddw(t['cutoff'])}")
     out.append(f"   Целевая цена: {_target_word(t.get('target'))}")
     out.append(f"7. Дайджест: {_every_word(t.get('digest_every', 1))} в "
@@ -854,13 +885,16 @@ def summary_msg(st) -> dict:
 
 
 def _editmenu_kb(st) -> dict:
+    # Метки 4/5 короткие: длинные «Дата и время «туда/обратно»» у части
+    # пользователей уходило под многоточие (шрифт inline-кнопок Telegram
+    # менять нельзя — сокращаем текст; время правится внутри блока).
     rows = [[{"text": "1️⃣ Город вылета", "callback_data": "d|jump|cf"},
              {"text": "2️⃣ Город прилёта", "callback_data": "d|jump|ct"}],
             [{"text": "3️⃣ Тип поездки", "callback_data": "d|jump|trip"},
-             {"text": "4️⃣ Дата и время «туда»",
+             {"text": "4️⃣ Дата «туда»",
               "callback_data": "d|jump|out"}]]
     if not _cur(st, "oneway"):
-        rows.append([{"text": "5️⃣ Дата и время «обратно»",
+        rows.append([{"text": "5️⃣ Дата «обратно»",
                       "callback_data": "d|jump|ret"}])
     rows.append([{"text": "6️⃣ Отсечка и цена", "callback_data": "d|jump|cut"},
                  {"text": "7️⃣ Дайджест", "callback_data": "d|jump|dig"}])
@@ -927,13 +961,13 @@ def _keep(db, crypto, uid, st, blk: str):
               "outdays": "гибкость вылета — "
                          + (_win_range(w_out) if w_out.get("from") else "—"),
               "outtime": f"время вылета — "
-                         f"{w_out.get('t1')}–{w_out.get('t2')}",
+                         f"{w_out.get('t1')}–{w_out.get('t2')} (местное)",
               "retdate": f"дата возврата — "
                          f"{_ddw((_cur(st, 'ret') or {}).get('from'))}",
               "retdays": "гибкость возврата — "
                          + (_win_range(w_ret) if w_ret.get("from") else "—"),
               "rettime": f"время возврата — "
-                         f"{w_ret.get('t1')}–{w_ret.get('t2')}",
+                         f"{w_ret.get('t1')}–{w_ret.get('t2')} (местное)",
               "cut": f"отсечка и цена — {_ddw(_cur(st, 'cutoff'))}, "
                      f"{_target_word(_cur(st, 'target'))}",
               "target": f"целевая цена — {_target_word(_cur(st, 'target'))}",

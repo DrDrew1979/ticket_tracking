@@ -175,6 +175,10 @@ def tracking_multiline(t: dict) -> str:
     ]
     if not t.get("oneway") and t.get("ret"):
         lines.append(f"Полёт «обратно»: {_win(t['ret'])}")
+    lines.append("⏰ Даты и время — местные, аэропортов вылета и "
+                 "возврата (как на билете)" if not t.get("oneway")
+                 else "⏰ Даты и время — местные, аэропорта вылета "
+                      "(как на билете)")
     lines.append(f"Дата отсечки: {_fmt(t.get('cutoff'))}")
     lines.append(f"Целевая цена: {t.get('target'):,} ₽".replace(",", " "))
     lines.append(f"Дайджест: каждые {t.get('digest_every')} дн. в "

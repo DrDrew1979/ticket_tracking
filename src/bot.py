@@ -119,7 +119,9 @@ HELP = (
     "/help — эта справка\n\n"
     "У одного пользователя одно активное отслеживание. Как только цена "
     "станет ниже вашей цели ИЛИ попадёт в минимум за 30 дней — придёт "
-    "мгновенный пуш. Дайджест — по вашему расписанию."
+    "мгновенный пуш. Дайджест — по вашему расписанию.\n\n"
+    "⏰ Даты и время рейсов — местные, аэропортов вылета и возврата "
+    "(как на билете). Время дайджеста — московское (МСК)."
 )
 
 ADMIN_HELP = (
@@ -165,12 +167,16 @@ def set_my_commands(token: str, admin_chat: str) -> None:
         pass
 
 
-def menu_kb(is_admin: bool) -> dict:
-    rows = [[{"text": "🧭 Настроить отслеживание",
-              "callback_data": "d|cmd|watch"}],
-            [{"text": "✏️ Изменить отслеживание",
-              "callback_data": "d|cmd|edit"},
-             {"text": "📋 Статус", "callback_data": "d|cmd|status"}],
+def menu_kb(is_admin: bool, has_tracking: bool | None = None) -> dict:
+    """Главное меню. has_tracking убирает синонимы: при активном
+    отслеживании показывается «Изменить», без него — «Настроить»
+    (раньше на экране были обе кнопки, хотя действие одно)."""
+    primary = ({"text": "✏️ Изменить отслеживание",
+                "callback_data": "d|cmd|edit"} if has_tracking else
+               {"text": "🧭 Настроить отслеживание",
+                "callback_data": "d|cmd|watch"})
+    rows = [[primary, {"text": "📋 Статус",
+                       "callback_data": "d|cmd|status"}],
             [{"text": "🚫 Удалить", "callback_data": "d|cmd|stop"},
              {"text": "❓ Помощь", "callback_data": "d|cmd|help"}]]
     if is_admin:
@@ -272,14 +278,15 @@ def _process_update(token, db, crypto, cfg, admin_chat, upd):
     if created and not is_admin:
         send_kb(token, chat_id,
                 "👋 Добро пожаловать! Я слежу за ценами билетов 24/7.\n\n"
-                + menu_text(), menu_kb(is_admin))
+                + menu_text(), menu_kb(is_admin, has_tracking=False))
     mu = cfg.get("multiuser") or {}
     if is_admin and _admin_command(token, db, crypto, uid, cfg, text,
                                    admin_chat):
         return
     cmd = text.split()[0].split("@")[0].lower()
     if cmd == "/menu":
-        send_kb(token, chat_id, menu_text(), menu_kb(is_admin))
+        send_kb(token, chat_id, menu_text(),
+                menu_kb(is_admin, bool(row["tracking_enc"])))
     elif cmd == "/start":
         _cmd_start(token, db, crypto, uid, row, is_admin, created)
     elif cmd == "/help":
@@ -291,7 +298,8 @@ def _process_update(token, db, crypto, cfg, admin_chat, upd):
         res = dialog.try_retry(db, crypto, uid, admin_chat, mu)
         if res == "ok":
             send_kb(token, chat_id, "✅ Отслеживание активировано из "
-                                    "сохранённых параметров!", menu_kb(False))
+                                    "сохранённых параметров!",
+                    menu_kb(False, has_tracking=True))
         elif res == "waitlist":
             send(token, chat_id, "⏳ Места всё ещё нет — как только "
                                  "освободится, сообщу.")
@@ -305,7 +313,7 @@ def _process_update(token, db, crypto, cfg, admin_chat, upd):
                     "📋 <b>Ваше отслеживание</b>\n"
                     + U.tracking_multiline(t)
                     + "\n\nИзменить: /edit; удалить: /stop",
-                    menu_kb(False))
+                    menu_kb(False, has_tracking=True))
         else:
             send(token, chat_id, "Отслеживания нет. Настроить: /watch")
     elif cmd == "/stop":
@@ -424,8 +432,9 @@ def _finish_tracking(token, db, crypto, cfg, admin_chat, mu, chat_id,
                 "/edit — изменение, /stop — удаление.")
         if joke:
             text += f"\n\n🎭 <i>{joke}</i>"
-        _edit(token, chat_id, msg_id, text, menu_kb(False)) \
-            if msg_id else send_kb(token, chat_id, text, menu_kb(False))
+        kb = menu_kb(False, has_tracking=True)
+        _edit(token, chat_id, msg_id, text, kb) \
+            if msg_id else send_kb(token, chat_id, text, kb)
     else:
         dialog.save_waitlist_draft(db, crypto, crypto.uid(chat_id), draft)
         send(token, chat_id,
@@ -435,23 +444,48 @@ def _finish_tracking(token, db, crypto, cfg, admin_chat, mu, chat_id,
 
 
 def _fetch_min_price(cfg: dict, draft: dict) -> int | None:
-    """ОДИН запрос к кэшу Aviasales по первой паре дат; минимум цены."""
+    """Минимум цены из кэша Aviasales: точные даты -> фолбэк на месяц.
+
+    Кэш по ДАЛЬНИМ датам часто пуст (никто ещё не искал эти даты) —
+    тогда берётся минимум за месяц вылета; причина отсутствия данных
+    всегда пишется в лог, чтобы админ видел, что случилось.
+    """
     import os
     token = os.environ.get("TP_TOKEN")
     out = draft.get("out") or {}
-    if not token or not out.get("from"):
+    if not out.get("from"):
+        return None
+    if not token:
+        log.warning("Подсказка цены: TP_TOKEN не задан в окружении "
+                    "(проверьте env в poll.yml)")
         return None
     try:
         from .fetcher import TPClient
         client = TPClient(token)
+        cur = cfg.get("currency", "rub")
         ret = None
         if not draft.get("oneway"):
             ret = (draft.get("ret") or {}).get("from")
         offers = client.fetch_roundtrip(draft["origin"], draft["dest"],
-                                        out["from"], ret,
-                                        cfg.get("currency", "rub"))
+                                        out["from"], ret, cur)
         prices = [int(o["price"]) for o in offers if o.get("price")]
-        return min(prices) if prices else None
+        if prices:
+            return min(prices)
+        # Фолбэк: точных дат нет в кэше — пробуем минимум за месяц
+        # вылета (и месяц возврата). Это всё ещё честный ориентир.
+        month = out["from"][:7]
+        offers = client.fetch_roundtrip(draft["origin"], draft["dest"],
+                                        month, ret[:7] if ret else None,
+                                        cur)
+        prices = [int(o["price"]) for o in offers if o.get("price")]
+        if prices:
+            log.info("Подсказка цены: точных дат нет в кэше, "
+                     "взят минимум за месяц %s", month)
+            return min(prices)
+        log.info("Подсказка цены: в кэше Aviasales нет данных ни по "
+                 "датам, ни по месяцу %s — предложение цены пропускается",
+                 month)
+        return None
     except Exception as e:  # noqa: BLE001
         log.warning("Поиск цены для цели не удался: %s", e)
         return None
@@ -467,7 +501,7 @@ def _cmd_start(token, db, crypto, uid, row, is_admin=False, created=False):
                       _msg_dict("📋 <b>Ваше отслеживание</b>\n"
                                 + U.tracking_multiline(t)
                                 + "\n\nИзменить: /edit; удалить: /stop",
-                                menu_kb(is_admin)))
+                                menu_kb(is_admin, has_tracking=True)))
         return
     st = crypto.dec(row["dialog_enc"]) if row["dialog_enc"] else {}
     if (st or {}).get("st") == "wl":
@@ -481,7 +515,7 @@ def _cmd_start(token, db, crypto, uid, row, is_admin=False, created=False):
         send_kb(token, chat, m["text"], m.get("kb"))
         return
     # существующий пользователь без трекинга — меню
-    send_kb(token, chat, menu_text(), menu_kb(is_admin))
+    send_kb(token, chat, menu_text(), menu_kb(is_admin, has_tracking=False))
 
 
 def _msg_dict(text, kb=None):
@@ -540,7 +574,7 @@ def _cmd_cb(token, db, crypto, uid, row, cfg, admin_chat, mu, chat_id,
             _show_or_send(token, chat_id, _msg_dict(
                 "📋 <b>Ваше отслеживание</b>\n" + U.tracking_multiline(t)
                 + "\n\nИзменить: /edit; удалить: /stop",
-                menu_kb(False)), msg_id)
+                menu_kb(False, has_tracking=True)), msg_id)
         else:
             _show_or_send(token, chat_id, _msg_dict(
                 "Отслеживания нет. Настроить: /watch",
@@ -578,10 +612,21 @@ def row_ident_chat(row, crypto):
     return str(ident.get("chat_id") or "")
 
 
+def _ident_fullname(ident: dict) -> str:
+    """Имя и фамилия целиком (если заполнены); фолбэк username/chat_id."""
+    name = " ".join(x for x in (ident.get("first"), ident.get("last")) if x)
+    return (name or ident.get("username")
+            or str(ident.get("chat_id") or "?")).strip()
+
+
 # ------------------------------------------------------- админ-панель
 
 def _admin_users_panel(token, db, crypto, chat_id, msg_id=None):
-    """Список пользователей + кнопки «инфо / удал / бан(разбан)» в строке."""
+    """Строка на пользователя: [имя+фамилия][логин][🗑][бан/разбан].
+
+    Имя — весь текст first+last; логин — URL-кнопка на профиль
+    (либо «—» с тостом chat_id, если логина нет).
+    """
     rows_all = db.all_users()
     if not rows_all:
         text = "Пользователей пока нет."
@@ -590,25 +635,33 @@ def _admin_users_panel(token, db, crypto, chat_id, msg_id=None):
         kb_rows = []
         for i, r in enumerate(rows_all, 1):
             ident = crypto.dec(r["ident_enc"]) or {}
-            name = (ident.get("first") or ident.get("username")
-                    or ident.get("chat_id") or "?")
             uid = r["uid"]
             banned = r["status"] == "banned"
             mark = "⛔ " if banned else ""
             tmark = "🎯" if r["tracking_enc"] else ""
             wl = " ⏳" if r["waitlist"] else ""
-            kb_rows.append([
-                {"text": f"ℹ️ {i}. {mark}{tmark}{wl}{name}"[:60],
-                 "callback_data": f"d|adm|info|{uid}"},
-                {"text": "🗑", "callback_data": f"d|adm|del|{uid}"},
-                {"text": "✅ разбан" if banned else "🚫 бан",
-                 "callback_data": (f"d|adm|unban|{uid}" if banned
-                                   else f"d|adm|ban|{uid}"),
-                 }])
+            row = [{"text": f"{i}. {mark}{tmark}{wl}"
+                            f"{_ident_fullname(ident)}"[:64],
+                    "callback_data": f"d|adm|info|{uid}"}]
+            un = (ident.get("username") or "").strip()
+            if un:
+                # колонка логина: тап открывает профиль в Telegram
+                row.append({"text": f"@{un}"[:64],
+                            "url": f"https://t.me/{un}"})
+            else:
+                row.append({"text": "—",
+                            "callback_data": f"d|adm|noun|{uid}"})
+            row.append({"text": "🗑", "callback_data": f"d|adm|del|{uid}"})
+            row.append({"text": "✅ разбан" if banned else "🚫 бан",
+                        "callback_data": (f"d|adm|unban|{uid}" if banned
+                                          else f"d|adm|ban|{uid}"),
+                        })
+            kb_rows.append(row)
         text = (f"👥 Пользователей: {len(rows_all)}.\n"
-                "Нажмите имя — карточка; 🗑 — удалить (с подтверждением); "
-                "🚫/✅ — бан/разбан. Пометки: 🎯 трекинг, ⏳ лист "
-                "ожидания, ⛔ бан.")
+                "Нажмите имя — карточка; логин — ссылка на профиль "
+                "(«—» — логина нет, тап покажет chat_id); 🗑 — удалить "
+                "(с подтверждением); 🚫/✅ — бан/разбан. Пометки: 🎯 "
+                "трекинг, ⏳ лист ожидания, ⛔ бан.")
         kb = {"inline_keyboard": kb_rows}
     if msg_id:
         _edit(token, chat_id, msg_id, text, kb)
@@ -629,6 +682,12 @@ def _admin_cb(token, db, crypto, cfg, admin_chat, admin_uid, chat_id,
         _answer_cb(token, cb_id)
         _admin_users_panel(token, db, crypto, chat_id, msg_id)
         return
+    if action == "noun":
+        row = db.get_user(target_uid)
+        ident = (crypto.dec(row["ident_enc"]) or {}) if row else {}
+        _answer_cb(token, cb_id, f"Логина нет; chat_id "
+                                 f"{ident.get('chat_id') or '?'}")
+        return
     if action == "info":
         _answer_cb(token, cb_id)
         card = U.user_card(db, crypto, target_uid)
@@ -647,9 +706,7 @@ def _admin_cb(token, db, crypto, cfg, admin_chat, admin_uid, chat_id,
         row = db.get_user(target_uid)
         name = "?"
         if row:
-            ident = crypto.dec(row["ident_enc"]) or {}
-            name = (ident.get("first") or ident.get("username")
-                    or ident.get("chat_id") or "?")
+            name = _ident_fullname(crypto.dec(row["ident_enc"]) or {})
         kb = {"inline_keyboard": [[
             {"text": "🗑 Да, удалить",
              "callback_data": f"d|adm|del2|{target_uid}"},

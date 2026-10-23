@@ -94,12 +94,18 @@ def month_kb(scope: str, y: int, m: int, lo: date, hi: date,
     week = []
     for _ in range(first_dow):
         week.append({"text": "·", "callback_data": NOOP})
+        # ВАЖНО: флаш после каждого дня — иначе в месяце, где часть дней
+        # уже прошла (lo внутри месяца), все точки слипнутся в ОДИН ряд
+        # из 20-30 кнопок, и Telegram сожмёт их в «прочерки» (баг
+        # «прочерков» в текущем месяце календаря).
+        if len(week) == 7:
+            rows.append(week)
+            week = []
     for day in range(1, ndays + 1):
         d = date(y, m, day)
         if d < lo:
             week.append({"text": "·", "callback_data": NOOP})
-            continue
-        if selected and d.isoformat() == selected:
+        elif selected and d.isoformat() == selected:
             week.append({"text": f"✅{day}",
                          "callback_data": CB.format(
                              scope=scope, arg=d.isoformat())})
