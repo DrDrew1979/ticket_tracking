@@ -2,13 +2,13 @@ name: flight-monitor
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # мониторинг + приём команд бота (каждые 30 мин)
+    - cron: "*/30 * * * *"   # мониторинг цен (команды бота забирает tg-live-poll)
     - cron: "0 6 * * *"      # дайджест владельца: 06:00 UTC = 09:00 МСК
     - cron: "0 * * * *"      # персональные дайджесты пользователей (ежечасно)
   workflow_dispatch:
     inputs:
       mode:
-        description: "monitor | digest | udigest"
+        description: "monitor | digest | udigest (bot — через poll.yml)"
         default: "monitor"
         type: string
 
@@ -55,6 +55,11 @@ jobs:
           HC_URL: ${{ secrets.HC_URL }}
           DB_KEY: ${{ secrets.DB_KEY }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          # Команды бота непрерывно забирает workflow tg-live-poll (poll.yml).
+          # Telegram запрещает два одновременных getUpdates-клиента (409),
+          # поэтому здесь поллинг выключен. Отключили poll.yml? Удалите
+          # эту строку — тогда monitor снова будет забирать команды сам.
+          SKIP_TG_POLL: "1"
         run: python -m src.main --mode "$MODE"
 
       - name: Commit price history
