@@ -27,6 +27,11 @@ def gen_key() -> str:
 class Crypto:
     def __init__(self, key: str):
         key = key.strip()
+        # Если при копировании потерялся хвостовой '=' (43 символа вместо
+        # 44) — восстанавливаем padding; ключ при этом не меняется.
+        # Любой другой мусор Fernet отвергнет (ValueError) — main.py
+        # перехватит и отключит мультиюзер, не роняя мониторинг.
+        key += "=" * ((-len(key)) % 4)
         self._key = key
         self._f = Fernet(key.encode())
 
